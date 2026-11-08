@@ -44,3 +44,43 @@ import Testing
     #expect(credential.expiresAt == nil)
     #expect(Mirror(reflecting: credential.oauthToken).children.isEmpty)
 }
+
+private struct ScopedAdapter: SocialAdapter {
+    let platform: SocialPlatform = .x
+    let capabilities: Set<SocialCapability> = [.publishText, .refreshSession]
+
+    func connect(_ authorization: SocialCredential) async throws -> SocialCredential { authorization }
+
+    func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
+        credential.grantedScopes?.contains("write") == true ? capabilities : [.refreshSession]
+    }
+
+    func publish(_ draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        SocialPost(id: "new", text: draft.text)
+    }
+
+    func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
+        SocialCredential(account: credential.account, accessToken: "renewed", grantedScopes: ["write"])
+    }
+}
+
+@Test func clientChecksGrantedScopesAndAllowsExpiredCredentialsToRefresh() async throws {
+    let client = SocialClient(adapter: ScopedAdapter(), store: MemoryCredentialStore())
+    let server = try #require(URL(string: "https://api.example"))
+    let account = SocialAccount(platform: .x, server: server, remoteID: "123", username: "example")
+    let draft = TextPost(text: "Hello")
+    _ = try await client.connect(SocialCredential(account: account, accessToken: "fixture", grantedScopes: []))
+    #expect(try await client.capabilities(for: account.id) == [.refreshSession])
+    await #expect(throws: SocialError.permissionDenied) {
+        try await client.publish(draft, as: account.id)
+    }
+
+    _ = try await client.connect(SocialCredential(
+        account: account, accessToken: "expired", expiresAt: .distantPast, grantedScopes: ["write"]
+    ))
+    await #expect(throws: SocialError.authenticationRequired) {
+        try await client.publish(draft, as: account.id)
+    }
+    _ = try await client.refresh(account.id)
+    #expect(try await client.publish(draft, as: account.id).id == "new")
+}
