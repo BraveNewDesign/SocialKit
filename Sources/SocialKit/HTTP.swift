@@ -5,6 +5,10 @@ public struct HTTPResponse: Sendable {
     public let headers: [String: String]
     public let body: Data
 
+    public func header(_ name: String) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
     public init(statusCode: Int, headers: [String: String] = [:], body: Data = Data()) {
         self.statusCode = statusCode
         self.headers = headers
@@ -65,7 +69,8 @@ struct HTTPClient: Sendable {
     func send(
         _ request: URLRequest,
         publishingKey: UUID? = nil,
-        authenticationErrorCodes: Set<String> = []
+        authenticationErrorCodes: Set<String> = [],
+        classifyError: @Sendable (HTTPResponse) -> SocialError? = { _ in nil }
     ) async throws -> HTTPResponse {
         try Task.checkCancellation()
 
@@ -80,6 +85,11 @@ struct HTTPClient: Sendable {
             throw SocialError.transportFailure
         }
 
+        if (400..<500).contains(response.statusCode), response.statusCode != 408,
+           let providerError = classifyError(response) {
+            throw providerError
+        }
+
         switch response.statusCode {
         case 200..<300:
             return response
@@ -92,10 +102,7 @@ struct HTTPClient: Sendable {
             }
             throw SocialError.httpStatus(response.statusCode)
         case 429:
-            let retryAfter = response.headers.first {
-                $0.key.caseInsensitiveCompare("Retry-After") == .orderedSame
-            }?.value
-            throw SocialError.rateLimited(retryAfter: retryAfter)
+            throw SocialError.rateLimited(retryAfter: response.header("Retry-After"))
         case 300...399, 408, 500...599:
             if let publishingKey {
                 throw SocialError.publishOutcomeUnknown(publishingKey)

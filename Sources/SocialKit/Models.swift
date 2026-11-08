@@ -3,6 +3,11 @@ import Foundation
 public enum SocialPlatform: String, Codable, Sendable, CaseIterable {
     case bluesky
     case mastodon
+    case threads
+    case facebookPages
+    case instagram
+    case linkedIn
+    case x
 }
 
 public enum SocialCapability: String, Sendable, CaseIterable {
@@ -13,6 +18,12 @@ public enum SocialCapability: String, Sendable, CaseIterable {
     case refreshSession
     case publishMedia
     case analytics
+    case listPosts
+    case reply
+    case readReplies
+    case deleteReply
+    case repost
+    case unrepost
 }
 
 public struct SocialAccount: Codable, Equatable, Sendable, Identifiable {
@@ -53,6 +64,39 @@ public struct TextPost: Codable, Sendable {
     }
 }
 
+public struct SocialPage<Item: Sendable>: Sendable {
+    public let items: [Item]
+    /// Opaque provider cursor. Pass it back to the same operation and account.
+    public let nextCursor: String?
+
+    public init(items: [Item], nextCursor: String? = nil) {
+        self.items = items
+        self.nextCursor = nextCursor
+    }
+}
+
+public enum SocialMedia: Sendable {
+    case imageURL(URL)
+    case videoURL(URL)
+    case imageData(Data, contentType: String)
+}
+
+public struct SocialAttachment: Equatable, Sendable {
+    public enum Kind: String, Sendable {
+        case image
+        case video
+        case unknown
+    }
+
+    public let kind: Kind
+    public let url: URL?
+
+    public init(kind: Kind, url: URL?) {
+        self.kind = kind
+        self.url = url
+    }
+}
+
 public struct SocialPost: Equatable, Sendable, Identifiable {
     public enum TextFormat: Equatable, Sendable {
         case plainText
@@ -65,6 +109,7 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
     public let createdAt: Date?
     public let likeCount: Int?
     public let textFormat: TextFormat
+    public let media: [SocialAttachment]
 
     public init(
         id: String,
@@ -72,7 +117,8 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
         url: URL? = nil,
         createdAt: Date? = nil,
         likeCount: Int? = nil,
-        textFormat: TextFormat = .plainText
+        textFormat: TextFormat = .plainText,
+        media: [SocialAttachment] = []
     ) {
         self.id = id
         self.text = text
@@ -80,6 +126,7 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
         self.createdAt = createdAt
         self.likeCount = likeCount
         self.textFormat = textFormat
+        self.media = media
     }
 }
 
@@ -96,6 +143,10 @@ public enum SocialError: Error, Equatable, Sendable {
     case transportFailure
     case publishOutcomeUnknown(UUID)
     case credentialStorage(Int32)
+    case permissionDenied
+    case billingRequired
+    case mediaProcessingFailed
+    case mediaProcessingTimedOut
 }
 
 extension SocialError: LocalizedError {
@@ -113,6 +164,10 @@ extension SocialError: LocalizedError {
         case .transportFailure: "The provider could not be reached."
         case .publishOutcomeUnknown: "The provider may have accepted the post. Check before retrying."
         case .credentialStorage: "The credential store could not complete the operation."
+        case .permissionDenied: "The provider denied permission for this operation."
+        case .billingRequired: "The provider requires API billing access or credits."
+        case .mediaProcessingFailed: "The provider could not process the media."
+        case .mediaProcessingTimedOut: "The media did not finish processing within the polling limit."
         }
     }
 }

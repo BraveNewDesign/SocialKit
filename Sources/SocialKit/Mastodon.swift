@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// Mastodon implementation of the provider-neutral social adapter.
@@ -9,7 +8,7 @@ public struct MastodonAdapter: SocialAdapter {
         public let applicationName: String
         public let website: URL?
         public let forceLogin: Bool
-        public let browser: @MainActor @Sendable (URL, URL) async throws -> URL
+        public let browser: OAuthBrowser
 
         public init(
             server: URL,
@@ -17,7 +16,7 @@ public struct MastodonAdapter: SocialAdapter {
             applicationName: String = "SocialKit",
             website: URL? = nil,
             forceLogin: Bool = false,
-            browser: @escaping @MainActor @Sendable (URL, URL) async throws -> URL
+            browser: @escaping OAuthBrowser
         ) {
             self.server = server
             self.redirectURI = redirectURI
@@ -39,7 +38,7 @@ public struct MastodonAdapter: SocialAdapter {
 
     public func connect(_ authorization: Authorization) async throws -> SocialCredential {
         let origin = try HTTPSOrigin(validating: authorization.server)
-        try Self.validateRedirectURI(authorization.redirectURI)
+        let transaction = try OAuthTransaction(redirectURI: authorization.redirectURI)
         guard !authorization.applicationName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw SocialError.invalidConfiguration
         }
@@ -70,29 +69,18 @@ public struct MastodonAdapter: SocialAdapter {
             throw SocialError.invalidResponse
         }
 
-        let verifier = Self.randomBase64URL(bytes: 32)
-        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString
-        let state = Self.randomBase64URL(bytes: 32)
-        var authorizationURL = try origin.endpoint("/oauth/authorize")
-        var components = URLComponents(url: authorizationURL, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: app.clientID),
-            URLQueryItem(name: "redirect_uri", value: authorization.redirectURI.absoluteString),
-            URLQueryItem(name: "scope", value: scopes),
-            URLQueryItem(name: "state", value: state),
-            URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "force_login", value: authorization.forceLogin ? "true" : "false")
-        ]
-        if let encodedQuery = components?.percentEncodedQuery {
-            components?.percentEncodedQuery = encodedQuery.replacingOccurrences(of: "+", with: "%2B")
-        }
-        guard let url = components?.url else { throw SocialError.invalidConfiguration }
-        authorizationURL = url
-
+        let authorizationURL = try OAuthForm.queryURL(origin.endpoint("/oauth/authorize"), parameters: [
+            ("response_type", "code"),
+            ("client_id", app.clientID),
+            ("redirect_uri", authorization.redirectURI.absoluteString),
+            ("scope", scopes),
+            ("state", transaction.state),
+            ("code_challenge", transaction.challenge),
+            ("code_challenge_method", "S256"),
+            ("force_login", authorization.forceLogin ? "true" : "false")
+        ])
         let callback = try await authorization.browser(authorizationURL, authorization.redirectURI)
-        let code = try Self.authorizationCode(from: callback, redirect: authorization.redirectURI, expectedState: state)
+        let code = try transaction.code(from: callback, allowsExtraParameters: false)
 
         let tokenResponse = try await requestJSON(
             origin.endpoint("/oauth/token"),
@@ -103,7 +91,7 @@ public struct MastodonAdapter: SocialAdapter {
                 ("client_id", app.clientID),
                 ("client_secret", app.clientSecret),
                 ("redirect_uri", authorization.redirectURI.absoluteString),
-                ("code_verifier", verifier)
+                ("code_verifier", transaction.verifier)
             ]
         )
         let token = try Self.decode(Token.self, from: tokenResponse.body)
@@ -137,7 +125,7 @@ public struct MastodonAdapter: SocialAdapter {
         request.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue(draft.idempotencyKey.uuidString, forHTTPHeaderField: "Idempotency-Key")
-        request.httpBody = Self.formEncoded([("status", draft.text)])
+        request.httpBody = OAuthForm.encode([("status", draft.text)])
 
         let response = try await HTTPClient(transport: transport).send(request, publishingKey: draft.idempotencyKey)
         do {
@@ -182,7 +170,7 @@ public struct MastodonAdapter: SocialAdapter {
         if let bearer { request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
         if let form {
             request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
-            request.httpBody = Self.formEncoded(form)
+            request.httpBody = OAuthForm.encode(form)
         }
         return try await HTTPClient(transport: transport).send(request)
     }
@@ -209,65 +197,12 @@ public struct MastodonAdapter: SocialAdapter {
         return try HTTPSOrigin(validating: credential.account.server)
     }
 
-    private static func validateRedirectURI(_ url: URL) throws {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased(),
-              !scheme.isEmpty,
-              components.user == nil, components.password == nil, components.fragment == nil, components.query == nil,
-              url.absoluteString == components.string,
-              scheme != "http", scheme != "https" || components.host != nil else {
-            throw SocialError.invalidConfiguration
-        }
-    }
-
-    private static func matchesRedirect(_ candidate: URL, _ expected: URL) -> Bool {
-        guard let actual = URLComponents(url: candidate, resolvingAgainstBaseURL: false),
-              let target = URLComponents(url: expected, resolvingAgainstBaseURL: false) else { return false }
-        return actual.scheme?.lowercased() == target.scheme?.lowercased()
-            && actual.host?.lowercased() == target.host?.lowercased()
-            && actual.port == target.port
-            && actual.percentEncodedPath == target.percentEncodedPath
-            && actual.user == target.user
-            && actual.password == target.password
-    }
-
-    private static func authorizationCode(from callback: URL, redirect: URL, expectedState: String) throws -> String {
-        guard matchesRedirect(callback, redirect),
-              let components = URLComponents(url: callback, resolvingAgainstBaseURL: false),
-              components.fragment == nil,
-              let items = components.queryItems,
-              items.count == 2,
-              items.filter({ $0.name == "state" }).count == 1,
-              items.filter({ $0.name == "code" }).count == 1,
-              let returnedState = items.first(where: { $0.name == "state" })?.value,
-              returnedState == expectedState,
-              let code = items.first(where: { $0.name == "code" })?.value,
-              !code.isEmpty else {
-            throw SocialError.authorizationFailed
-        }
-        return code
-    }
-
     private static func pathComponent(_ value: String) throws -> String {
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         guard !value.isEmpty, value.unicodeScalars.allSatisfy(allowed.contains), value != ".", value != ".." else {
             throw SocialError.invalidInput
         }
         return value
-    }
-
-    private static func randomBase64URL(bytes count: Int) -> String {
-        var data = Data((0..<count).map { _ in UInt8.random(in: .min ... .max) })
-        defer { data.resetBytes(in: 0..<data.count) }
-        return data.base64URLEncodedString
-    }
-
-    private static func formEncoded(_ values: [(String, String)]) -> Data {
-        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._*")
-        let text = values.map { key, value in
-            "\(key.formURLEncoded(allowed: allowed))=\(value.formURLEncoded(allowed: allowed))"
-        }.joined(separator: "&")
-        return Data(text.utf8)
     }
 
     private struct Application: Decodable {
@@ -320,20 +255,5 @@ private extension JSONDecoder {
             throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid Mastodon timestamp")
         }
         return decoder
-    }
-}
-
-private extension Data {
-    var base64URLEncodedString: String {
-        base64EncodedString().replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-    }
-}
-
-private extension String {
-    func formURLEncoded(allowed: CharacterSet) -> String {
-        addingPercentEncoding(withAllowedCharacters: allowed)?
-            .replacingOccurrences(of: " ", with: "+") ?? self
     }
 }

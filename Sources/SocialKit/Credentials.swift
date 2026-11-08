@@ -6,11 +6,25 @@ public struct SocialCredential: Codable, Sendable, CustomStringConvertible, Cust
     public let account: SocialAccount
     public let accessToken: String
     public let refreshToken: String?
+    public let expiresAt: Date?
+    public let grantedScopes: Set<String>?
 
-    public init(account: SocialAccount, accessToken: String, refreshToken: String? = nil) {
+    public init(
+        account: SocialAccount,
+        accessToken: String,
+        refreshToken: String? = nil,
+        expiresAt: Date? = nil,
+        grantedScopes: Set<String>? = nil
+    ) {
         self.account = account
         self.accessToken = accessToken
         self.refreshToken = refreshToken
+        self.expiresAt = expiresAt
+        self.grantedScopes = grantedScopes
+    }
+
+    public var oauthToken: OAuthToken {
+        OAuthToken(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, grantedScopes: grantedScopes)
     }
 
     public var description: String { "SocialCredential(\(account.platform.rawValue), redacted)" }

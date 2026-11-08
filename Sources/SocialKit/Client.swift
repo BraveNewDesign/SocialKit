@@ -63,6 +63,54 @@ public actor SocialClient<Adapter: SocialAdapter> {
         }
     }
 
+    public func capabilities(for id: SocialAccount.ID) async throws -> Set<SocialCapability> {
+        guard id.platform == platform else { throw SocialError.invalidInput }
+        guard let credential = try await store.credential(for: id), credential.account.id == id else {
+            throw SocialError.authenticationRequired
+        }
+        return adapter.capabilities(for: credential).intersection(capabilities)
+    }
+
+    public func posts(cursor: String? = nil, as id: SocialAccount.ID) async throws -> SocialPage<SocialPost> {
+        try await withCredential(id, requiring: .listPosts) { credential in
+            try await adapter.posts(cursor: cursor, credential: credential)
+        }
+    }
+
+    public func reply(_ draft: TextPost, to postID: String, as id: SocialAccount.ID) async throws -> SocialPost {
+        try await withCredential(id, requiring: .reply) { credential in
+            try await adapter.reply(draft, to: postID, credential: credential)
+        }
+    }
+
+    public func replies(
+        to postID: String, cursor: String? = nil, as id: SocialAccount.ID
+    ) async throws -> SocialPage<SocialPost> {
+        try await withCredential(id, requiring: .readReplies) { credential in
+            try await adapter.replies(to: postID, cursor: cursor, credential: credential)
+        }
+    }
+
+    public func deleteReply(id replyID: String, as account: SocialAccount.ID) async throws {
+        try await withCredential(account, requiring: .deleteReply) { credential in
+            try await adapter.deleteReply(id: replyID, credential: credential)
+        }
+    }
+
+    public func publishMedia(
+        _ media: SocialMedia, draft: TextPost, as id: SocialAccount.ID
+    ) async throws -> SocialPost {
+        try await withCredential(id, requiring: .publishMedia) { credential in
+            try await adapter.publishMedia(media, draft: draft, credential: credential)
+        }
+    }
+
+    public func setReposted(_ reposted: Bool, postID: String, as id: SocialAccount.ID) async throws {
+        try await withCredential(id, requiring: reposted ? .repost : .unrepost) { credential in
+            try await adapter.setReposted(reposted, postID: postID, credential: credential)
+        }
+    }
+
     private func begin(_ id: SocialAccount.ID) throws {
         guard id.platform == platform else { throw SocialError.invalidInput }
         guard busyAccounts.insert(id).inserted else { throw SocialError.accountBusy }
@@ -81,6 +129,12 @@ public actor SocialClient<Adapter: SocialAdapter> {
             throw SocialError.authenticationRequired
         }
         guard credential.account.id == id else { throw SocialError.invalidResponse }
+        guard adapter.capabilities(for: credential).contains(capability) else {
+            throw SocialError.permissionDenied
+        }
+        if capability != .refreshSession, let expiresAt = credential.expiresAt, expiresAt <= Date() {
+            throw SocialError.authenticationRequired
+        }
         return try await operation(credential)
     }
 }
