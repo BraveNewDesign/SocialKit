@@ -84,6 +84,7 @@ struct MetaTests {
     @MainActor
     func facebookPageConnectPublishAndLike() async throws {
         let transport = MetaStubTransport([
+            json(#"{"data":[{"permission":"pages_show_list","status":"granted"},{"permission":"pages_manage_posts","status":"granted"},{"permission":"pages_read_engagement","status":"granted"},{"permission":"pages_manage_engagement","status":"granted"},{"permission":"pages_read_user_content","status":"granted"},{"permission":"pages_manage_metadata","status":"declined"}]}"#),
             json(#"{"data":[{"id":"page42","name":"Page 42","access_token":"page-token","tasks":["CREATE_CONTENT"]}],"paging":{}}"#),
             json(#"{"id":"page42_9"}"#),
             json(#"{"success":true}"#),
@@ -102,14 +103,17 @@ struct MetaTests {
         try await adapter.setLiked(true, postID: post.id, credential: credential)
         try await adapter.setLiked(false, postID: post.id, credential: credential)
         let requests = await transport.requests
-        #expect(requests[0].url?.path == "/v27.0/me/accounts")
-        #expect(requests[1].url?.path == "/v27.0/page42/feed")
-        #expect(form(requests[1]) == ["message": "Page update"])
-        #expect(requests[2].url?.path == "/v27.0/page42_9/likes")
-        #expect(requests[2].httpMethod == "POST")
-        #expect(requests[3].httpMethod == "DELETE")
+        #expect(requests[0].url?.path == "/v27.0/me/permissions")
+        #expect(requests[1].url?.path == "/v27.0/me/accounts")
+        #expect(requests[2].url?.path == "/v27.0/page42/feed")
+        #expect(form(requests[2]) == ["message": "Page update"])
+        #expect(requests[3].url?.path == "/v27.0/page42_9/likes")
+        #expect(requests[3].httpMethod == "POST")
+        #expect(requests[4].httpMethod == "DELETE")
         #expect(requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer user-token")
-        #expect(requests.dropFirst().allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer page-token" })
+        #expect(requests[1].value(forHTTPHeaderField: "Authorization") == "Bearer user-token")
+        #expect(requests.dropFirst(2).allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer page-token" })
+        #expect(credential.grantedScopes == ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "pages_manage_engagement", "pages_read_user_content"])
     }
 
     @Test("Facebook Page comment writes, comment pages and deletion use the Page token")
@@ -139,6 +143,7 @@ struct MetaTests {
     @MainActor
     func facebookRejectsAmbiguousPage() async throws {
         let transport = MetaStubTransport([
+            json(#"{"data":[{"permission":"pages_show_list","status":"granted"},{"permission":"pages_manage_posts","status":"granted"}]}"#),
             json(#"{"data":[{"id":"one","name":"One","access_token":"token-1","tasks":["CREATE_CONTENT"]},{"id":"two","name":"Two","access_token":"token-2","tasks":["CREATE_CONTENT"]}],"paging":{}}"#)
         ])
         let adapter = FacebookPagesAdapter(transport: transport)
@@ -149,6 +154,76 @@ struct MetaTests {
                 exchange: MockOAuthExchange()
             ))
         }
+    }
+
+    @Test("Meta development credentials verify profiles and granted Facebook permissions")
+    func metaDevelopmentCredentials() async throws {
+        let threadsTransport = MetaStubTransport([json(#"{"id":"threads-user","username":"alice"}"#),
+                                                   json(#"{"id":"threads-user","username":"alice"}"#)])
+        let threads = ThreadsAdapter(transport: threadsTransport)
+        let threadCredential = try await threads.developmentCredential(OAuthToken(accessToken: "dev-thread-token"))
+        #expect(threadCredential.account.remoteID == "threads-user")
+        #expect(threadCredential.grantedScopes == nil)
+        #expect(try await threads.profile(credential: threadCredential).username == "alice")
+
+        let instagramTransport = MetaStubTransport([json(#"{"id":"app-scoped","user_id":"ig-user","username":"studio"}"#),
+                                                     json(#"{"id":"app-scoped","user_id":"ig-user","username":"studio"}"#)])
+        let instagram = InstagramAdapter(transport: instagramTransport)
+        let instagramCredential = try await instagram.developmentCredential(OAuthToken(accessToken: "dev-ig-token"))
+        #expect(instagramCredential.account.remoteID == "ig-user")
+        #expect(try await instagram.profile(credential: instagramCredential).username == "studio")
+
+        let facebookTransport = MetaStubTransport([
+            json(#"{"data":[{"permission":"pages_show_list","status":"granted"},{"permission":"pages_manage_posts","status":"granted"},{"permission":"pages_manage_engagement","status":"declined"}]}"#),
+            json(#"{"data":[{"id":"page42","name":"Brand Page","tasks":["ANALYZE"]}],"paging":{}}"#),
+            json(#"{"data":[{"permission":"pages_show_list","status":"granted"},{"permission":"pages_manage_posts","status":"granted"},{"permission":"pages_manage_engagement","status":"declined"}]}"#),
+            json(#"{"data":[{"id":"page42","name":"Brand Page","access_token":"page-token","tasks":["ANALYZE"]}],"paging":{}}"#),
+            json(#"{"id":"page42","name":"Brand Page"}"#),
+            json(#"{"id":"page42","name":"Updated Page Name"}"#)
+        ])
+        let facebook = FacebookPagesAdapter(transport: facebookTransport)
+        let token = OAuthToken(accessToken: "dev-user-token")
+        let pages = try await facebook.discoverPages(token)
+        #expect(pages.map(\.remoteID) == ["page42"])
+        let pageCredential = try await facebook.developmentCredential(token, pageID: "page42")
+        #expect(pageCredential.accessToken == "page-token")
+        #expect(pageCredential.expiresAt == nil)
+        #expect(pageCredential.refreshToken == nil)
+        #expect(pageCredential.grantedScopes == ["pages_show_list", "pages_manage_posts"])
+        #expect(!facebook.capabilities(for: pageCredential).contains(.like))
+        #expect(try await facebook.profile(credential: pageCredential).username == "Updated Page Name")
+    }
+
+    @Test("Meta development token imports reject known-expired tokens before making requests")
+    func expiredMetaDevelopmentTokens() async throws {
+        let transport = MetaStubTransport([])
+        let expired = OAuthToken(accessToken: "expired-token", expiresAt: .distantPast)
+        await #expect(throws: SocialError.authenticationRequired) {
+            try await ThreadsAdapter(transport: transport).developmentCredential(expired)
+        }
+        await #expect(throws: SocialError.authenticationRequired) {
+            try await InstagramAdapter(transport: transport).developmentCredential(expired)
+        }
+        await #expect(throws: SocialError.authenticationRequired) {
+            try await FacebookPagesAdapter(transport: transport).discoverPages(expired)
+        }
+        #expect(await transport.requests.isEmpty)
+    }
+
+    @Test("Meta development token imports reject whitespace and control characters before making requests")
+    func malformedMetaDevelopmentTokens() async throws {
+        let transport = MetaStubTransport([])
+        let malformed = OAuthToken(accessToken: "user-token\nInjected: value")
+        await #expect(throws: SocialError.invalidInput) {
+            try await ThreadsAdapter(transport: transport).developmentCredential(malformed)
+        }
+        await #expect(throws: SocialError.invalidInput) {
+            try await InstagramAdapter(transport: transport).developmentCredential(malformed)
+        }
+        await #expect(throws: SocialError.invalidInput) {
+            try await FacebookPagesAdapter(transport: transport).discoverPages(malformed)
+        }
+        #expect(await transport.requests.isEmpty)
     }
 
     @Test("Instagram Login creates an image container, polls it, publishes and returns media without a read-after-write")

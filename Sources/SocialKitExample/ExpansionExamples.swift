@@ -76,6 +76,7 @@ func runExpansionExamples(platform: SocialPlatform?) async throws {
 
     if platform == nil || platform == .facebookPages {
         let facebook = SocialClient(adapter: FacebookPagesAdapter(transport: ExampleTransport([
+            Fixture("GET", "/v27.0/me/permissions", #"{"data":[{"permission":"pages_manage_posts","status":"granted"},{"permission":"pages_show_list","status":"granted"}]}"#),
             Fixture("GET", "/v27.0/me/accounts", #"{"data":[{"id":"201","name":"Demo Page","access_token":"page-token","tasks":["CREATE_CONTENT"]}]}"#),
             Fixture("POST", "/v27.0/201/feed", #"{"id":"201_202"}"#)
         ])), store: store)

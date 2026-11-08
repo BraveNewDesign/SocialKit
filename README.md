@@ -26,3 +26,7 @@ swift run SocialKitExample --platform instagram
 See [Setup and usage](docs/SETUP.md) for credential storage and publishing recovery, [Platform setup and capabilities](docs/PLATFORMS.md) for permission and infrastructure requirements, and [Dependency notes](docs/DEPENDENCIES.md) for sources evaluated. Provider behavior is verified against mocked HTTP. Live account access and signed-app Keychain use require separate verification.
 
 The optional `SocialKitUI` library product provides a SwiftUI connection button, publishing form, and operation result view. It takes your existing connection and publishing closures and shares the SDK’s cancellation and uncertain-write behavior. [SwiftUI integration](docs/SETUP.md#optional-swiftui-components) · [Adapter audit and verification](docs/AUDIT.md)
+
+## Live Meta validation on macOS
+
+Run `./scripts/run-meta-validation.sh` to open the native validation app for Facebook Pages, Threads and Instagram. Follow the [Meta setup and live checklist](docs/META_VALIDATION.md) to connect your own test accounts and run read-only checks.

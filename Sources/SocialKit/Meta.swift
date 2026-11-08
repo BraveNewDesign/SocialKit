@@ -79,6 +79,15 @@ struct MetaHTTP: Sendable {
 
 struct MetaSuccess: Decodable, Sendable { let success: Bool }
 
+func validateMetaDevelopmentToken(_ token: OAuthToken) throws {
+    guard !token.accessToken.isEmpty else { throw SocialError.authenticationRequired }
+    let hasWhitespaceOrControl = token.accessToken.unicodeScalars.contains {
+        CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
+    }
+    guard !hasWhitespaceOrControl else { throw SocialError.invalidInput }
+    if let expiry = token.expiresAt, expiry <= .now { throw SocialError.authenticationRequired }
+}
+
 struct MetaGraphError: Decodable, Sendable {
     struct Detail: Decodable, Sendable {
         let code: Int?

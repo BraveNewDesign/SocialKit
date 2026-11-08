@@ -58,6 +58,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
         let code = try transaction.code(from: normalizeMetaOAuthCallback(callback, platform: .facebookPages))
         let userToken = try await authorization.exchange.exchange(platform: .facebookPages, code: code, redirectURI: authorization.redirectURI)
         let userAPI = try MetaHTTP(transport: transport, origin: origin, accessToken: userToken.accessToken)
+        let grantedScopes = try await verifiedPermissions(api: userAPI)
         var cursor: String?
         var eligible: [FacebookPageChoice] = []
         var found: FacebookPageChoice?
@@ -96,7 +97,84 @@ public struct FacebookPagesAdapter: SocialAdapter {
         let account = SocialAccount(platform: .facebookPages, server: accountServer, remoteID: selected.id,
                                     username: selected.name.isEmpty ? selected.id : selected.name)
         return SocialCredential(account: account, accessToken: selected.access_token,
-                                grantedScopes: userToken.grantedScopes ?? authorization.scopes)
+                                grantedScopes: grantedScopes)
+    }
+
+    /// Lists Pages available to a user access token, for an explicit development picker.
+    public func discoverPages(_ token: OAuthToken) async throws -> [SocialAccount] {
+        try validateMetaDevelopmentToken(token)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: token.accessToken)
+        _ = try await verifiedPermissions(api: api)
+        let choices = try await pageListings(api: api)
+        return choices.map { choice in
+            SocialAccount(platform: .facebookPages, server: accountServer, remoteID: choice.id,
+                          username: choice.name.isEmpty ? choice.id : choice.name)
+        }
+    }
+
+    /// Creates a Page credential for a selected Page using a development user access token.
+    public func developmentCredential(_ token: OAuthToken, pageID: String) async throws -> SocialCredential {
+        try validateMetaDevelopmentToken(token)
+        let pageID = try metaPathID(pageID)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: token.accessToken)
+        let scopes = try await verifiedPermissions(api: api)
+        let choices = try await pageChoices(api: api)
+        guard let page = choices.first(where: { $0.id == pageID }) else { throw SocialError.invalidInput }
+        guard !page.access_token.isEmpty else { throw SocialError.invalidResponse }
+        let account = SocialAccount(platform: .facebookPages, server: accountServer, remoteID: page.id,
+                                    username: page.name.isEmpty ? page.id : page.name)
+        let credential = SocialCredential(account: account, accessToken: page.access_token, grantedScopes: scopes)
+        _ = try await profile(credential: credential) // Confirm that the Page token resolves the selected Page.
+        return credential
+    }
+
+    /// Fetches the Page name associated with a Page credential.
+    public func profile(credential: SocialCredential) async throws -> SocialAccount {
+        try validate(credential)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let profile: FacebookPageProfile = try await api.get("/me", query: [("fields", "id,name")])
+        guard profile.id == credential.account.remoteID else { throw SocialError.invalidResponse }
+        return SocialAccount(platform: .facebookPages, server: accountServer, remoteID: profile.id,
+                             username: profile.name.isEmpty ? profile.id : profile.name)
+    }
+
+    private func verifiedPermissions(api: MetaHTTP) async throws -> Set<String> {
+        let response: MetaPageResponse<FacebookPermission> = try await api.get("/me/permissions")
+        return Set(response.data.filter { $0.status == "granted" }.map(\.permission))
+    }
+
+    private func pageChoices(api: MetaHTTP) async throws -> [FacebookPageChoice] {
+        var cursor: String?
+        var choices: [FacebookPageChoice] = []
+        var seenCursors = Set<String>()
+        for _ in 0..<50 {
+            var query = [("fields", "id,name,access_token,tasks"), ("limit", "100")]
+            if let cursor { query.append(("after", cursor)) }
+            let page: MetaPageResponse<FacebookPageChoice> = try await api.get("/me/accounts", query: query)
+            choices.append(contentsOf: page.data)
+            guard page.paging?.next != nil else { return choices }
+            guard let after = page.paging?.cursors?.after, !after.isEmpty,
+                  seenCursors.insert(after).inserted else { throw SocialError.invalidResponse }
+            cursor = after
+        }
+        throw SocialError.invalidResponse
+    }
+
+    private func pageListings(api: MetaHTTP) async throws -> [FacebookPageListing] {
+        var cursor: String?
+        var choices: [FacebookPageListing] = []
+        var seenCursors = Set<String>()
+        for _ in 0..<50 {
+            var query = [("fields", "id,name,tasks"), ("limit", "100")]
+            if let cursor { query.append(("after", cursor)) }
+            let page: MetaPageResponse<FacebookPageListing> = try await api.get("/me/accounts", query: query)
+            choices.append(contentsOf: page.data)
+            guard page.paging?.next != nil else { return choices }
+            guard let after = page.paging?.cursors?.after, !after.isEmpty,
+                  seenCursors.insert(after).inserted else { throw SocialError.invalidResponse }
+            cursor = after
+        }
+        throw SocialError.invalidResponse
     }
 
     public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
@@ -190,4 +268,20 @@ private struct FacebookPageChoice: Decodable, Sendable {
     let access_token: String
     let tasks: [String]?
     var canPublish: Bool { tasks?.contains("CREATE_CONTENT") == true }
+}
+
+private struct FacebookPageListing: Decodable, Sendable {
+    let id: String
+    let name: String
+    let tasks: [String]?
+}
+
+private struct FacebookPermission: Decodable, Sendable {
+    let permission: String
+    let status: String
+}
+
+private struct FacebookPageProfile: Decodable, Sendable {
+    let id: String
+    let name: String
 }

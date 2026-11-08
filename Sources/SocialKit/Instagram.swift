@@ -63,12 +63,30 @@ public struct InstagramAdapter: SocialAdapter {
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
         let code = try transaction.code(from: normalizeMetaOAuthCallback(callback, platform: .instagram))
         let token = try await authorization.exchange.exchange(platform: .instagram, code: code, redirectURI: authorization.redirectURI)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: token.accessToken)
+        let account = try await fetchProfile(accessToken: token.accessToken)
+        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
+                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+    }
+
+    /// Builds an Instagram credential from an access token supplied by a development token flow.
+    public func developmentCredential(_ token: OAuthToken) async throws -> SocialCredential {
+        try validateMetaDevelopmentToken(token)
+        let account = try await fetchProfile(accessToken: token.accessToken)
+        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
+                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+    }
+
+    /// Fetches the authenticated Instagram professional account associated with this credential.
+    public func profile(credential: SocialCredential) async throws -> SocialAccount {
+        try validate(credential)
+        return try await fetchProfile(accessToken: credential.accessToken)
+    }
+
+    private func fetchProfile(accessToken: String) async throws -> SocialAccount {
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: accessToken)
         let profile: InstagramProfile = try await api.get("/me", query: [("fields", "id,user_id,username")])
         guard let userID = profile.user_id ?? profile.id, !userID.isEmpty else { throw SocialError.invalidResponse }
-        let account = SocialAccount(platform: .instagram, server: accountServer, remoteID: userID, username: profile.username)
-        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
-                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes ?? authorization.scopes)
+        return SocialAccount(platform: .instagram, server: accountServer, remoteID: userID, username: profile.username)
     }
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {

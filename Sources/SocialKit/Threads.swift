@@ -66,12 +66,30 @@ public struct ThreadsAdapter: SocialAdapter {
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
         let code = try transaction.code(from: callback)
         let token = try await authorization.exchange.exchange(platform: .threads, code: code, redirectURI: authorization.redirectURI)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: token.accessToken)
+        let account = try await fetchProfile(accessToken: token.accessToken)
+        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
+                               expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+    }
+
+    /// Builds a Threads credential from an access token supplied by a development token flow.
+    public func developmentCredential(_ token: OAuthToken) async throws -> SocialCredential {
+        try validateMetaDevelopmentToken(token)
+        let account = try await fetchProfile(accessToken: token.accessToken)
+        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
+                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+    }
+
+    /// Fetches the authenticated Threads profile associated with this credential.
+    public func profile(credential: SocialCredential) async throws -> SocialAccount {
+        try validate(credential)
+        return try await fetchProfile(accessToken: credential.accessToken)
+    }
+
+    private func fetchProfile(accessToken: String) async throws -> SocialAccount {
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: accessToken)
         let profile: ThreadsProfile = try await api.get("/me", query: [("fields", "id,username")])
         guard !profile.id.isEmpty else { throw SocialError.invalidResponse }
-        let account = SocialAccount(platform: .threads, server: accountServer, remoteID: profile.id, username: profile.username)
-        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
-                               expiresAt: token.expiresAt, grantedScopes: token.grantedScopes ?? authorization.scopes)
+        return SocialAccount(platform: .threads, server: accountServer, remoteID: profile.id, username: profile.username)
     }
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
