@@ -19,8 +19,10 @@ struct MetaHTTP: Sendable {
         try await send(path, method: "GET", query: query, publishingKey: nil)
     }
 
-    func post<T: Decodable>(_ path: String, form: [(String, String)], key: UUID? = nil) async throws -> T {
-        try await send(path, method: "POST", form: form, publishingKey: key)
+    func post<T: Decodable>(
+        _ path: String, form: [(String, String)], key: UUID? = nil, query: [(String, String)] = []
+    ) async throws -> T {
+        try await send(path, method: "POST", query: query, form: form, publishingKey: key)
     }
 
     func delete(_ path: String) async throws {
@@ -142,7 +144,7 @@ struct MetaCommentRecord: Decodable, Sendable {
     }
 }
 
-private func metaDate(_ value: String) -> Date? {
+func metaDate(_ value: String) -> Date? {
     let formatter = ISO8601DateFormatter()
     if let date = formatter.date(from: value) { return date }
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

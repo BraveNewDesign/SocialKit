@@ -28,7 +28,7 @@ public struct MastodonAdapter: SocialAdapter {
     }
 
     public let platform: SocialPlatform = .mastodon
-    public let capabilities: Set<SocialCapability> = [.publishText, .readPost, .like, .unlike]
+    public let capabilities: Set<SocialCapability> = [.publishText, .readPost, .listPosts, .like, .unlike]
 
     private let transport: any HTTPTransport
 
@@ -43,11 +43,14 @@ public struct MastodonAdapter: SocialAdapter {
             throw SocialError.invalidConfiguration
         }
 
-        let scopes = "read:accounts read:statuses write:statuses write:favourites"
         let metadataResponse = try await requestJSON(origin.endpoint("/.well-known/oauth-authorization-server"))
         let metadata = try Self.decode(OAuthMetadata.self, from: metadataResponse.body)
+        let advertised = Set(metadata.scopesSupported)
+        let identityScope = advertised.contains("profile") ? "profile" : "read:accounts"
+        let requestedScopes = [identityScope, "read:statuses", "write:statuses", "write:favourites"]
+        let scopes = requestedScopes.joined(separator: " ")
         guard metadata.codeChallengeMethodsSupported.contains("S256"),
-              Set(scopes.split(separator: " ").map(String.init)).isSubset(of: Set(metadata.scopesSupported)) else {
+              Set(requestedScopes).isSubset(of: advertised) else {
             throw SocialError.invalidConfiguration
         }
 
@@ -95,7 +98,8 @@ public struct MastodonAdapter: SocialAdapter {
             ]
         )
         let token = try Self.decode(Token.self, from: tokenResponse.body)
-        guard !token.accessToken.isEmpty else { throw SocialError.invalidResponse }
+        guard !token.accessToken.isEmpty,
+              (token.tokenType?.lowercased() ?? "bearer") == "bearer" else { throw SocialError.invalidResponse }
 
         let accountResponse = try await requestJSON(
             origin.endpoint("/api/v1/accounts/verify_credentials"),
@@ -110,8 +114,20 @@ public struct MastodonAdapter: SocialAdapter {
                 remoteID: account.id,
                 username: account.acct
             ),
-            accessToken: token.accessToken
+            accessToken: token.accessToken,
+            grantedScopes: token.scope.map { Set($0.split(whereSeparator: \.isWhitespace).map(String.init)) }
+                ?? Set(requestedScopes)
         )
+    }
+
+    public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
+        guard credential.account.platform == .mastodon else { return [] }
+        guard let scopes = credential.grantedScopes else { return capabilities }
+        var result: Set<SocialCapability> = []
+        if scopes.contains("read") || scopes.contains("read:statuses") { result.formUnion([.readPost, .listPosts]) }
+        if scopes.contains("write") || scopes.contains("write:statuses") { result.insert(.publishText) }
+        if scopes.contains("write") || scopes.contains("write:favourites") { result.formUnion([.like, .unlike]) }
+        return result
     }
 
     public func publish(_ draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
@@ -146,6 +162,26 @@ public struct MastodonAdapter: SocialAdapter {
         let status = try Self.decode(Status.self, from: response.body)
         guard status.id == id else { throw SocialError.invalidResponse }
         return Self.post(status)
+    }
+
+    public func posts(cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
+        let origin = try Self.origin(for: credential)
+        let path = "/api/v1/accounts/\(try Self.pathComponent(credential.account.remoteID))/statuses"
+        var query: [URLQueryItem] = []
+        if let cursor {
+            query.append(URLQueryItem(name: "max_id", value: try Self.pathComponent(cursor)))
+        }
+        let response = try await requestJSON(origin.endpoint(path, query: query), bearer: credential.accessToken)
+        let statuses = try Self.decode([Status].self, from: response.body)
+        let next = response.header("Link")?.split(separator: ",").compactMap { part -> String? in
+            guard let open = part.firstIndex(of: "<"), let close = part[open...].firstIndex(of: ">"),
+                  part[close...].contains("rel=\"next\""),
+                  let url = URLComponents(string: String(part[part.index(after: open)..<close])),
+                  let value = url.queryItems?.first(where: { $0.name == "max_id" })?.value,
+                  value != cursor else { return nil }
+            return try? Self.pathComponent(value)
+        }.first
+        return SocialPage(items: statuses.map(Self.post), nextCursor: next)
     }
 
     public func setLiked(_ liked: Bool, postID: String, credential: SocialCredential) async throws {
@@ -222,7 +258,9 @@ public struct MastodonAdapter: SocialAdapter {
 
     private struct Token: Decodable {
         let accessToken: String
-        enum CodingKeys: String, CodingKey { case accessToken = "access_token" }
+        let tokenType: String?
+        let scope: String?
+        enum CodingKeys: String, CodingKey { case accessToken = "access_token", tokenType = "token_type", scope }
     }
 
     private struct Account: Decodable { let id: String; let acct: String }

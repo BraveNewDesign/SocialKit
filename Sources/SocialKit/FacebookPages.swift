@@ -74,11 +74,12 @@ public struct FacebookPagesAdapter: SocialAdapter {
                 if result.canPublish { found = result; break }
             }
             eligible.append(contentsOf: page.data.filter(\.canPublish))
-            guard page.paging?.next != nil, let after = page.paging?.cursors?.after else {
+            guard page.paging?.next != nil else {
                 completedScan = true
                 break
             }
-            guard seenCursors.insert(after).inserted else { throw SocialError.invalidResponse }
+            guard let after = page.paging?.cursors?.after, !after.isEmpty,
+                  seenCursors.insert(after).inserted else { throw SocialError.invalidResponse }
             cursor = after
         }
         let selected: FacebookPageChoice
@@ -115,6 +116,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
         let result: MetaID = try await api.post("/\(try metaPathID(credential.account.remoteID))/feed",
                                                 form: [("message", draft.text)], key: draft.idempotencyKey)
+        guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text)
     }
 
@@ -155,6 +157,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
         guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SocialError.invalidInput }
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
         let result: MetaID = try await api.post("/\(try metaPathID(postID))/comments", form: [("message", draft.text)], key: draft.idempotencyKey)
+        guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text)
     }
 

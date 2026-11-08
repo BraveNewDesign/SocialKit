@@ -49,7 +49,9 @@ struct OAuthTransaction: Sendable {
 
     init(redirectURI: URL) throws {
         guard let components = URLComponents(url: redirectURI, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased(), scheme != "http",
+              let scheme = components.scheme?.lowercased(),
+              !["http", "file", "data", "javascript", "about", "ftp", "blob"].contains(scheme),
+              components.host?.isEmpty == false || !components.path.isEmpty,
               scheme != "https" || components.host?.isEmpty == false,
               components.user == nil, components.password == nil,
               components.query == nil, components.fragment == nil else {
@@ -59,6 +61,7 @@ struct OAuthTransaction: Sendable {
     }
 
     func code(from callback: URL, allowsExtraParameters: Bool = true) throws -> String {
+        try Task.checkCancellation()
         guard var actual = URLComponents(url: callback, resolvingAgainstBaseURL: false),
               actual.fragment == nil,
               let query = actual.queryItems,

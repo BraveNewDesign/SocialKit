@@ -33,7 +33,7 @@ public struct ThreadsAdapter: SocialAdapter {
     public typealias Authorization = ThreadsAuthorization
     public let platform: SocialPlatform = .threads
     public let capabilities: Set<SocialCapability> = [
-        .publishText, .readPost, .listPosts, .reply, .readReplies, .deleteReply,
+        .publishText, .readPost, .listPosts, .reply, .readReplies, .deleteReply, .moderateReplies,
         .publishMedia, .repost, .refreshSession
     ]
 
@@ -94,7 +94,7 @@ public struct ThreadsAdapter: SocialAdapter {
         guard scopes.contains("threads_basic") else { return [] }
         if !scopes.contains("threads_content_publish") { result.remove(.publishText); result.remove(.publishMedia); result.remove(.reply); result.remove(.repost) }
         if !scopes.contains("threads_read_replies") { result.remove(.readReplies) }
-        if !scopes.contains("threads_manage_replies") { result.remove(.reply) }
+        if !scopes.contains("threads_manage_replies") { result.subtract([.reply, .moderateReplies]) }
         if !scopes.contains("threads_delete") { result.remove(.deleteReply) }
         return result
     }
@@ -109,8 +109,7 @@ public struct ThreadsAdapter: SocialAdapter {
 
     private func publishContainer(media: SocialMedia?, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
         try validate(credential)
-        let textLength = draft.text.unicodeScalars.reduce(0) { partial, scalar in partial + (scalar.value > 0xFFFF ? 4 : 1) }
-        guard textLength <= 500, media != nil || !draft.text.isEmpty else { throw SocialError.invalidInput }
+        try Self.validateText(draft.text, allowsEmpty: media != nil)
         let id = try metaPathID(credential.account.remoteID)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
         var form: [(String, String)] = [("media_type", "TEXT"), ("text", draft.text)]
@@ -122,10 +121,11 @@ public struct ThreadsAdapter: SocialAdapter {
             try requireHTTPS(url); form = [("media_type", "VIDEO"), ("video_url", url.absoluteString), ("text", draft.text)]
         case .imageData: throw SocialError.invalidInput // Threads fetches public URLs; binary upload is not available in this contract.
         }
-        let container: MetaID = try await api.post("/\(id)/threads", form: form, key: draft.idempotencyKey)
+        let container: MetaID = try await api.post("/\(id)/threads", form: form)
         let ready = try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey)
         guard ready else { throw SocialError.mediaProcessingTimedOut }
         let result: MetaID = try await api.post("/\(id)/threads_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text, media: socialAttachments(for: media))
     }
 
@@ -133,6 +133,7 @@ public struct ThreadsAdapter: SocialAdapter {
         let path = "/\(try metaPathID(id))"
         for attempt in 0..<pollAttempts {
             let status: ThreadsContainerStatus = try await api.get(path, query: [("fields", "id,status,error_message")])
+            guard status.id == id else { throw SocialError.invalidResponse }
             switch status.status {
             case "FINISHED": return true
             case "PUBLISHED": throw SocialError.publishOutcomeUnknown(publishingKey)
@@ -165,15 +166,16 @@ public struct ThreadsAdapter: SocialAdapter {
 
     public func reply(_ draft: TextPost, to postID: String, credential: SocialCredential) async throws -> SocialPost {
         try validate(credential)
-        guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SocialError.invalidInput }
+        try Self.validateText(draft.text, allowsEmpty: false)
         let owner = try metaPathID(credential.account.remoteID)
         let target = try metaPathID(postID)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
         let container: MetaID = try await api.post("/\(owner)/threads", form: [
             ("media_type", "TEXT"), ("text", draft.text), ("reply_to_id", target)
-        ], key: draft.idempotencyKey)
+        ])
         guard try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
         let result: MetaID = try await api.post("/\(owner)/threads_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text)
     }
 
@@ -183,7 +185,19 @@ public struct ThreadsAdapter: SocialAdapter {
         var query = [("fields", "id,text,username,timestamp,permalink,media_type,media_url")]
         if let cursor { query.append(("after", cursor)) }
         let value: MetaPageResponse<MetaPostRecord> = try await api.get("/\(try metaPathID(postID))/replies", query: query)
-        return SocialPage(items: value.data.map(metaPost), nextCursor: value.paging?.next == nil ? nil : value.paging?.cursors?.after)
+        let after = value.paging?.cursors?.after
+        let next = value.data.isEmpty || after == cursor ? nil : after
+        return SocialPage(items: value.data.map(metaPost), nextCursor: next)
+    }
+
+    public func setReplyHidden(_ hidden: Bool, id: String, credential: SocialCredential) async throws {
+        try validate(credential)
+        guard capabilities(for: credential).contains(.moderateReplies) else { throw SocialError.permissionDenied }
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let result: MetaSuccess = try await api.post(
+            "/\(try metaPathID(id))/manage_reply", form: [], query: [("hide", String(hidden))]
+        )
+        guard result.success else { throw SocialError.invalidResponse }
     }
 
     public func deleteReply(id: String, credential: SocialCredential) async throws {
@@ -203,6 +217,13 @@ public struct ThreadsAdapter: SocialAdapter {
     private func validate(_ credential: SocialCredential) throws {
         guard credential.account.platform == .threads, credential.account.server == accountServer else { throw SocialError.invalidConfiguration }
         guard !credential.accessToken.isEmpty else { throw SocialError.authenticationRequired }
+    }
+
+    private static func validateText(_ text: String, allowsEmpty: Bool) throws {
+        let length = text.unicodeScalars.reduce(0) { $0 + ($1.value > 0xFFFF ? 4 : 1) }
+        guard length <= 500, allowsEmpty || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw SocialError.invalidInput
+        }
     }
 
     private func requireHTTPS(_ url: URL) throws {

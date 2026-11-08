@@ -31,7 +31,7 @@ public struct InstagramAdapter: SocialAdapter {
     public typealias Authorization = InstagramAuthorization
     public let platform: SocialPlatform = .instagram
     public let capabilities: Set<SocialCapability> = [
-        .readPost, .listPosts, .reply, .readReplies, .deleteReply, .publishMedia, .refreshSession
+        .readPost, .listPosts, .reply, .readReplies, .deleteReply, .publishMedia, .publishMultipleMedia, .refreshSession
     ]
 
     private let transport: any HTTPTransport
@@ -89,7 +89,7 @@ public struct InstagramAdapter: SocialAdapter {
         guard let scopes = credential.grantedScopes else { return capabilities }
         var result = capabilities
         guard scopes.contains("instagram_business_basic") else { return [] }
-        if !scopes.contains("instagram_business_content_publish") { result.remove(.publishMedia) }
+        if !scopes.contains("instagram_business_content_publish") { result.subtract([.publishMedia, .publishMultipleMedia]) }
         if !scopes.contains("instagram_business_manage_comments") {
             result.remove(.reply); result.remove(.readReplies); result.remove(.deleteReply)
         }
@@ -117,8 +117,8 @@ public struct InstagramAdapter: SocialAdapter {
         case .imageData:
             throw SocialError.invalidInput // Instagram's container API fetches public media URLs.
         }
-        let container: MetaID = try await api.post("/\(accountID)/media", form: form, key: draft.idempotencyKey)
-        guard try await waitForContainer(container.id, api: api) else { throw SocialError.mediaProcessingTimedOut }
+        let container: MetaID = try await api.post("/\(accountID)/media", form: form)
+        guard try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
         let result: MetaID = try await api.post("/\(accountID)/media_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
         let attachment: SocialAttachment
         switch media {
@@ -126,17 +126,75 @@ public struct InstagramAdapter: SocialAdapter {
         case .videoURL(let url): attachment = SocialAttachment(kind: .video, url: url)
         case .imageData: attachment = SocialAttachment(kind: .unknown, url: nil)
         }
+        guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text, media: [attachment])
     }
 
-    private func waitForContainer(_ id: String, api: MetaHTTP) async throws -> Bool {
+    /// Publishes an Instagram carousel containing two to ten ordered images and/or videos.
+    /// Instagram fetches each source URL directly; this adapter does not download media.
+    public func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        if media.count == 1, let first = media.first {
+            return try await publishMedia(first, draft: draft, credential: credential)
+        }
+        guard (2...10).contains(media.count) else { throw SocialError.invalidInput }
+        try validate(credential)
+        let items = try media.map { item -> (URL, String) in
+            switch item {
+            case .imageURL(let url):
+                try requireHTTPS(url)
+                return (url, "IMAGE")
+            case .videoURL(let url):
+                try requireHTTPS(url)
+                return (url, "VIDEO") // Carousel video children use VIDEO; REELS is for standalone reels.
+            case .imageData:
+                throw SocialError.invalidInput
+            }
+        }
+
+        let accountID = try metaPathID(credential.account.remoteID)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        var children: [String] = []
+        for (url, mediaType) in items {
+            let sourceField = mediaType == "IMAGE" ? "image_url" : "video_url"
+            let child: MetaID = try await api.post("/\(accountID)/media", form: [
+                (sourceField, url.absoluteString),
+                ("media_type", mediaType),
+                ("is_carousel_item", "true")
+            ])
+            guard let id = try? metaPathID(child.id) else { throw SocialError.invalidResponse }
+            children.append(id)
+        }
+        for child in children {
+            guard try await waitForContainer(child, api: api) else { throw SocialError.mediaProcessingTimedOut }
+        }
+
+        var form = [("media_type", "CAROUSEL"), ("children", children.joined(separator: ","))]
+        if !draft.text.isEmpty { form.append(("caption", draft.text)) }
+        let container: MetaID = try await api.post("/\(accountID)/media", form: form)
+        guard try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
+        // Publishing is a single, non-retried operation. HTTPClient reports an unknown outcome
+        // with the draft key if the request may have reached Meta but no response was confirmed.
+        let result: MetaID = try await api.post("/\(accountID)/media_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        let attachments = items.map { url, type in
+            SocialAttachment(kind: type == "IMAGE" ? .image : .video, url: url)
+        }
+        guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
+        return SocialPost(id: result.id, text: draft.text, media: attachments)
+    }
+
+    private func waitForContainer(_ id: String, api: MetaHTTP, publishingKey: UUID? = nil) async throws -> Bool {
         let path = "/\(try metaPathID(id))"
         for attempt in 0..<pollAttempts {
             let status: InstagramContainerStatus = try await api.get(path, query: [("fields", "id,status_code,status")])
+            guard status.id == id else { throw SocialError.invalidResponse }
             switch status.status_code {
             case "FINISHED": return true
+            case "PUBLISHED":
+                if let publishingKey { throw SocialError.publishOutcomeUnknown(publishingKey) }
+                throw SocialError.invalidResponse
             case "ERROR", "EXPIRED": throw SocialError.mediaProcessingFailed
-            default: break
+            case "IN_PROGRESS": break
+            default: throw SocialError.invalidResponse
             }
             if attempt + 1 < pollAttempts, pollIntervalNanoseconds > 0 {
                 try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
@@ -148,8 +206,13 @@ public struct InstagramAdapter: SocialAdapter {
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
         try validate(credential)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
-        let value: MetaPostRecord = try await api.get("/\(try metaPathID(id))", query: [("fields", Self.postFields)])
-        return metaPost(value)
+        let mediaID = try metaPathID(id)
+        let value: InstagramPostRecord = try await api.get("/\(mediaID)", query: [("fields", Self.postFields)])
+        let post = value.post
+        guard value.media_type?.uppercased() == "CAROUSEL_ALBUM" else { return post }
+        let children: InstagramChildrenResponse = try await api.get("/\(mediaID)/children", query: [("fields", "media_type,media_url")])
+        return SocialPost(id: post.id, text: post.text, url: post.url, createdAt: post.createdAt,
+                          likeCount: post.likeCount, media: children.data.map(\.attachment))
     }
 
     public func posts(cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
@@ -157,8 +220,8 @@ public struct InstagramAdapter: SocialAdapter {
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
         var query = [("fields", Self.postFields), ("limit", "100")]
         if let cursor { query.append(("after", cursor)) }
-        let result: MetaPageResponse<MetaPostRecord> = try await api.get("/\(try metaPathID(credential.account.remoteID))/media", query: query)
-        return SocialPage(items: result.data.map(metaPost), nextCursor: result.paging?.next == nil ? nil : result.paging?.cursors?.after)
+        let result: MetaPageResponse<InstagramPostRecord> = try await api.get("/\(try metaPathID(credential.account.remoteID))/media", query: query)
+        return SocialPage(items: result.data.map(\.post), nextCursor: result.paging?.next == nil ? nil : result.paging?.cursors?.after)
     }
 
     /// Creates a reply to an existing Instagram comment (not a new top-level media comment).
@@ -203,3 +266,32 @@ public struct InstagramAdapter: SocialAdapter {
 private struct InstagramProfile: Decodable, Sendable { let id: String?; let user_id: String?; let username: String }
 private struct InstagramContainerStatus: Decodable, Sendable { let id: String; let status_code: String }
 private struct InstagramRefreshResponse: Decodable, Sendable { let access_token: String; let expires_in: Int }
+private struct InstagramChildrenResponse: Decodable, Sendable {
+    struct Child: Decodable, Sendable {
+        let media_type: String?
+        let media_url: URL?
+        var attachment: SocialAttachment {
+            let kind: SocialAttachment.Kind = media_type?.uppercased() == "IMAGE" ? .image :
+                (media_type?.uppercased() == "VIDEO" || media_type?.uppercased() == "REELS" ? .video : .unknown)
+            return SocialAttachment(kind: kind, url: media_url)
+        }
+    }
+    let data: [Child]
+}
+private struct InstagramPostRecord: Decodable, Sendable {
+    let id: String
+    let caption: String?
+    let permalink: URL?
+    let timestamp: String?
+    let like_count: Int?
+    let media_type: String?
+    let media_url: URL?
+
+    var post: SocialPost {
+        let kind: SocialAttachment.Kind = media_type?.uppercased() == "IMAGE" ? .image :
+            (media_type?.uppercased() == "VIDEO" || media_type?.uppercased() == "REELS" ? .video : .unknown)
+        let attachments = media_type == nil ? [] : [SocialAttachment(kind: kind, url: media_url)]
+        let createdAt = timestamp.flatMap { ISO8601DateFormatter().date(from: $0) }
+        return SocialPost(id: id, text: caption ?? "", url: permalink, createdAt: createdAt, likeCount: like_count, media: attachments)
+    }
+}

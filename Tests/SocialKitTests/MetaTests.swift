@@ -236,6 +236,23 @@ struct MetaTests {
         #expect(requests[3].url?.path == "/v1.0/post1/repost")
     }
 
+    @Test("Threads moderates replies and uses cursors without following paging links")
+    func moderatesThreadsReplies() async throws {
+        let transport = MetaStubTransport([
+            json(#"{"data":[{"id":"r1","text":"Reply"}],"paging":{"cursors":{"after":"older"}}}"#),
+            json(#"{"success":true}"#), json(#"{"success":true}"#)
+        ])
+        let adapter = ThreadsAdapter(transport: transport)
+        let credential = threadsCredential()
+        let page = try await adapter.replies(to: "t1", cursor: nil, credential: credential)
+        #expect(page.nextCursor == "older")
+        try await adapter.setReplyHidden(true, id: "r1", credential: credential)
+        try await adapter.setReplyHidden(false, id: "r1", credential: credential)
+        let requests = await transport.requests
+        #expect(requests.dropFirst().allSatisfy { $0.url?.path == "/v1.0/r1/manage_reply" })
+        #expect(requests.dropFirst().map { $0.url?.query } == ["hide=true", "hide=false"])
+    }
+
     @Test("Long-lived Threads tokens refresh without losing account or scope metadata")
     func threadsRefresh() async throws {
         let transport = MetaStubTransport([json(#"{"access_token":"renewed-token","expires_in":5184000}"#)])

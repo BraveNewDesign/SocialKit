@@ -192,11 +192,82 @@ struct XTests {
         #expect(transport.requests.count == 2)
     }
 
-    private func credential() -> SocialCredential {
+    @Test("Image publishing uses user-scoped v2 multipart uploads and creates one multi-image post")
+    func publishesImages() async throws {
+        let transport = XStubTransport([
+            json(#"{"data":{"id":"30001"}}"#),
+            json(#"{"data":{"id":"30002"}}"#),
+            json(#"{"data":{"id":"40001","text":"Two images"}}"#)
+        ])
+        let adapter = XAdapter(clientID: "client", includeMediaWriteScope: true, transport: transport)
+        let account = credential(scopes: ["tweet.read", "users.read", "tweet.write", "media.write"])
+        let result = try await adapter.publishMedia([
+            .imageData(Data([0x89, 0x50, 0x4e, 0x47]), contentType: "image/png"),
+            .imageData(Data([0xff, 0xd8, 0xff]), contentType: "image/jpeg")
+        ], draft: TextPost(text: "Two images"), credential: account)
+
+        #expect(result.id == "40001")
+        #expect(transport.requests.map { $0.url?.path } == ["/2/media/upload", "/2/media/upload", "/2/tweets"])
+        for upload in transport.requests.prefix(2) {
+            #expect(upload.httpMethod == "POST")
+            #expect(upload.value(forHTTPHeaderField: "Authorization") == "Bearer saved-access-token")
+            #expect(upload.value(forHTTPHeaderField: "Content-Type")?.contains("multipart/form-data; boundary=") == true)
+            let body = try #require(upload.httpBody)
+            #expect(String(data: body, encoding: .isoLatin1)?.contains("tweet_image") == true)
+            #expect(String(data: body, encoding: .isoLatin1)?.contains("name=\"media\"") == true)
+        }
+        let postBody = try #require(transport.requests[2].httpBody)
+        let json = try #require(JSONSerialization.jsonObject(with: postBody) as? [String: Any])
+        let media = try #require(json["media"] as? [String: [String]])
+        #expect(media["media_ids"] == ["30001", "30002"])
+        #expect(transport.requests[2].httpMethod == "POST")
+    }
+
+    @Test("Image validation and missing media.write scope fail before any request")
+    func rejectsInvalidMediaBeforeRequests() async throws {
+        let transport = XStubTransport([])
+        let adapter = XAdapter(clientID: "client", includeMediaWriteScope: true, transport: transport)
+        let account = credential(scopes: ["tweet.read", "users.read", "tweet.write", "media.write"])
+        await #expect(throws: SocialError.invalidInput) {
+            try await adapter.publishMedia([
+                .imageData(Data([1]), contentType: "image/png"),
+                .videoURL(URL(string: "https://cdn.example.test/v.mp4")!)
+            ], draft: TextPost(text: "Invalid"), credential: account)
+        }
+        await #expect(throws: SocialError.permissionDenied) {
+            try await adapter.publishMedia(
+                .imageData(Data([1]), contentType: "image/png"),
+                draft: TextPost(text: "No scope"),
+                credential: credential(scopes: ["tweet.write"])
+            )
+        }
+        #expect(transport.requests.isEmpty)
+    }
+
+    @Test("Media post creation maps ambiguous outcomes and sends the final create once")
+    func mediaCreateUncertaintyIsNotRetried() async throws {
+        let transport = XStubTransport([
+            json(#"{"data":{"id":"30001"}}"#),
+            HTTPResponse(statusCode: 503),
+            json(#"{"data":{"id":"40001","text":"Image"}}"#)
+        ])
+        let adapter = XAdapter(clientID: "client", includeMediaWriteScope: true, transport: transport)
+        let draft = TextPost(text: "Image")
+        await #expect(throws: SocialError.publishOutcomeUnknown(draft.idempotencyKey)) {
+            try await adapter.publishMedia(
+                .imageData(Data([1]), contentType: "image/png"), draft: draft,
+                credential: credential(scopes: ["tweet.read", "users.read", "tweet.write", "media.write"])
+            )
+        }
+        #expect(transport.requests.count == 2)
+        #expect(transport.requests.last?.url?.path == "/2/tweets")
+    }
+
+    private func credential(scopes: Set<String> = ["tweet.read", "users.read", "tweet.write", "like.write", "offline.access"]) -> SocialCredential {
         SocialCredential(
             account: SocialAccount(platform: .x, server: URL(string: "https://api.x.com")!, remoteID: "12345", username: "alice"),
             accessToken: "saved-access-token", refreshToken: "refresh-token",
-            grantedScopes: ["tweet.read", "users.read", "tweet.write", "like.write", "offline.access"]
+            grantedScopes: scopes
         )
     }
 

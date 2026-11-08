@@ -66,7 +66,7 @@ struct LinkedInTests {
         let postURN = "urn:li:ugcPost:777"
         let commentURN = "urn:li:comment:(urn:li:ugcPost:777,888)"
         let transport = LinkedInTransport([
-            json(#"{"id":"urn:li:ugcPost:777","author":"urn:li:person:member-7","commentary":"Hello"}"#),
+            json(#"{"id":"urn:li:ugcPost:777","author":"urn:li:person:member-7","commentary":"Hello","content":{"multiImage":{"images":[{"id":"urn:li:image:one"},{"id":"urn:li:image:two"}]}}}"#),
             json(#"{"elements":[{"id":"urn:li:ugcPost:777","author":"urn:li:person:member-7","commentary":"Hello","publishedAt":1800000000000}],"paging":{"total":2}}"#),
             json(#"{"elements":[{"commentUrn":"urn:li:comment:(urn:li:ugcPost:777,888)","message":{"text":"Thanks"},"created":{"time":1800000000000}}],"paging":{"total":2}}"#)
         ])
@@ -74,6 +74,7 @@ struct LinkedInTests {
         let readCredential = credential(scopes: ["r_member_social", "r_member_social_feed"])
         let post = try await adapter.post(id: postURN, credential: readCredential)
         #expect(post.text == "Hello")
+        #expect(post.media.map(\.kind) == [.image, .image])
         #expect(transport.requests[0].url?.absoluteString == "https://api.linkedin.com/rest/posts/urn%3Ali%3AugcPost%3A777")
         let posts = try await adapter.posts(cursor: nil, credential: readCredential)
         let comments = try await adapter.replies(to: postURN, cursor: nil, credential: readCredential)
@@ -95,7 +96,7 @@ struct LinkedInTests {
     @Test("Image bytes upload only to the approved LinkedIn host before post creation")
     func uploadsImageBytesThenPublishes() async throws {
         let transport = LinkedInTransport([
-            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/upload-1?sig=ok","image":"urn:li:image:abc123"}}"#),
+            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/upload-1?sig=ok","uploadUrlExpiresAt":4102444800000,"image":"urn:li:image:abc123"}}"#),
             HTTPResponse(statusCode: 201),
             HTTPResponse(statusCode: 201, headers: ["x-restli-id": "urn:li:share:444"])
         ])
@@ -106,9 +107,60 @@ struct LinkedInTests {
         #expect(transport.requests[0].url?.path == "/rest/images")
         #expect(transport.requests[1].url?.host == "www.linkedin.com")
         #expect(transport.requests[1].httpMethod == "PUT")
-        #expect(transport.requests[1].value(forHTTPHeaderField: "Authorization") == "Bearer token")
+        #expect(transport.requests[1].value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
         #expect(transport.requests[1].httpBody == Data([0x89, 0x50, 0x4E, 0x47]))
         #expect(transport.requests[2].url?.path == "/rest/posts")
+    }
+
+    @Test("MultiImage uploads every validated image before one organic post write")
+    func publishesMultiImagePost() async throws {
+        let transport = LinkedInTransport([
+            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/one?sig=1","uploadUrlExpiresAt":4102444800000,"image":"urn:li:image:one"}}"#),
+            HTTPResponse(statusCode: 201),
+            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/two?sig=2","uploadUrlExpiresAt":4102444800000,"image":"urn:li:image:two"}}"#),
+            HTTPResponse(statusCode: 201),
+            HTTPResponse(statusCode: 201, headers: ["x-restli-id": "urn:li:ugcPost:446"])
+        ])
+        let adapter = LinkedInAdapter(transport: transport)
+        let images: [SocialMedia] = [
+            .imageData(Data([1]), contentType: "image/jpeg"),
+            .imageData(Data([2]), contentType: "image/png")
+        ]
+        let result = try await adapter.publishMedia(images, draft: TextPost(text: "Set"), credential: credential(scopes: ["w_member_social"]))
+        #expect(result.id == "urn:li:ugcPost:446")
+        #expect(result.media.count == 2)
+        #expect(transport.requests.map(\.httpMethod) == ["POST", "PUT", "POST", "PUT", "POST"])
+        #expect(transport.requests[0].url?.path == "/rest/images")
+        let body = try #require(transport.requests.last?.httpBody)
+        let object = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let content = try #require(object["content"] as? [String: Any])
+        let multiImage = try #require(content["multiImage"] as? [String: Any])
+        let media = try #require(multiImage["images"] as? [[String: String]])
+        #expect(media.map { $0["id"] } == ["urn:li:image:one", "urn:li:image:two"])
+        #expect(transport.requests[1].value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer ") == true)
+    }
+
+    @Test("MultiImage rejects invalid batches before any upload and rejects expired URLs")
+    func validatesMultiImageAndUploadExpiry() async throws {
+        let noRequests = LinkedInTransport([])
+        await #expect(throws: SocialError.invalidInput) {
+            try await LinkedInAdapter(transport: noRequests).publishMedia(
+                [.imageData(Data([1]), contentType: "image/jpeg"), .videoURL(URL(string: "https://example.com/v.mp4")!)],
+                draft: TextPost(text: "Set"), credential: credential(scopes: ["w_member_social"])
+            )
+        }
+        #expect(noRequests.requests.isEmpty)
+
+        let expired = LinkedInTransport([
+            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/one?sig=1","uploadUrlExpiresAt":1,"image":"urn:li:image:one"}}"#)
+        ])
+        await #expect(throws: SocialError.invalidResponse) {
+            try await LinkedInAdapter(transport: expired).publishMedia(
+                [.imageData(Data([1]), contentType: "image/jpeg"), .imageData(Data([2]), contentType: "image/png")],
+                draft: TextPost(text: "Set"), credential: credential(scopes: ["w_member_social"])
+            )
+        }
+        #expect(expired.requests.count == 1)
     }
 
     @Test("Organization roles are checked when the granted admin scope permits it")
@@ -141,7 +193,7 @@ struct LinkedInTests {
     func waitsForReadableImageStatus() async throws {
         let org = "urn:li:organization:900"
         let transport = LinkedInTransport([
-            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/upload-1?sig=ok","image":"urn:li:image:abc123"}}"#),
+            json(#"{"value":{"uploadUrl":"https://www.linkedin.com/dms-uploads/upload-1?sig=ok","uploadUrlExpiresAt":4102444800000,"image":"urn:li:image:abc123"}}"#),
             HTTPResponse(statusCode: 201),
             json(#"{"id":"urn:li:image:abc123","owner":"urn:li:organization:900","status":"PROCESSING"}"#),
             json(#"{"id":"urn:li:image:abc123","owner":"urn:li:organization:900","status":"AVAILABLE"}"#),
@@ -205,7 +257,7 @@ struct LinkedInTests {
     @Test("Unvalidated upload hosts never receive the bearer token")
     func rejectsUntrustedUploadURL() async throws {
         let transport = LinkedInTransport([
-            json(#"{"value":{"uploadUrl":"https://attacker.example/dms-uploads/upload-1?sig=bad","image":"urn:li:image:abc123"}}"#)
+            json(#"{"value":{"uploadUrl":"https://attacker.example/dms-uploads/upload-1?sig=bad","uploadUrlExpiresAt":4102444800000,"image":"urn:li:image:abc123"}}"#)
         ])
         await #expect(throws: SocialError.invalidResponse) {
             try await LinkedInAdapter(transport: transport).publishMedia(

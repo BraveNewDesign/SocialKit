@@ -14,16 +14,26 @@ public struct XAdapter: SocialAdapter {
     }
 
     public let platform: SocialPlatform = .x
-    public let capabilities: Set<SocialCapability> = [
-        .publishText, .readPost, .listPosts, .reply, .readReplies, .deleteReply,
-        .like, .unlike, .repost, .unrepost, .refreshSession
-    ]
+    public var capabilities: Set<SocialCapability> {
+        var result: Set<SocialCapability> = [
+            .publishText, .readPost, .listPosts, .reply, .readReplies, .deleteReply,
+            .like, .unlike, .repost, .unrepost, .refreshSession
+        ]
+        if includeMediaWriteScope { result.formUnion([.publishMedia, .publishMultipleMedia]) }
+        return result
+    }
 
     private let transport: any HTTPTransport
     private let clientID: String
+    private let includeMediaWriteScope: Bool
 
-    public init(clientID: String, transport: any HTTPTransport = URLSessionTransport()) {
+    public init(
+        clientID: String,
+        includeMediaWriteScope: Bool = false,
+        transport: any HTTPTransport = URLSessionTransport()
+    ) {
         self.clientID = clientID
+        self.includeMediaWriteScope = includeMediaWriteScope
         self.transport = transport
     }
 
@@ -36,7 +46,7 @@ public struct XAdapter: SocialAdapter {
             ("response_type", "code"),
             ("client_id", clientID),
             ("redirect_uri", authorization.redirectURI.absoluteString),
-            ("scope", Self.scopes.joined(separator: " ")),
+            ("scope", Self.scopes(includeMediaWrite: includeMediaWriteScope).joined(separator: " ")),
             ("state", transaction.state),
             ("code_challenge", transaction.challenge),
             ("code_challenge_method", "S256")
@@ -72,7 +82,7 @@ public struct XAdapter: SocialAdapter {
             accessToken: token.accessToken,
             refreshToken: token.refreshToken,
             expiresAt: Date.now.addingTimeInterval(TimeInterval(token.expiresIn)),
-            grantedScopes: token.scope.map { Set(Self.parseScopes($0)) } ?? Set(Self.scopes)
+            grantedScopes: token.scope.map { Set(Self.parseScopes($0)) } ?? Set(Self.scopes(includeMediaWrite: includeMediaWriteScope))
         )
     }
 
@@ -109,18 +119,44 @@ public struct XAdapter: SocialAdapter {
         try await createPost(draft, replyTo: nil, credential: credential)
     }
 
+    /// Uploads one to four images, then creates one post with their media IDs.
+    public func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try Self.validate(credential)
+        guard includeMediaWriteScope else { throw SocialError.unsupported(.publishMedia) }
+        guard capabilities(for: credential).contains(.publishMedia) else { throw SocialError.permissionDenied }
+        guard (1...4).contains(media.count) else { throw SocialError.invalidInput }
+        let images = try media.map { item -> (Data, String) in
+            guard case let .imageData(data, contentType) = item, !data.isEmpty,
+                  data.count <= Self.maxImageBytes, Self.imageTypes.contains(contentType.lowercased()) else {
+                throw SocialError.invalidInput
+            }
+            return (data, contentType.lowercased())
+        }
+        var mediaIDs: [String] = []
+        for (data, contentType) in images {
+            mediaIDs.append(try await uploadImage(data, contentType: contentType, credential: credential))
+        }
+        return try await createPost(draft, replyTo: nil, mediaIDs: mediaIDs, credential: credential)
+    }
+
+    public func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try await publishMedia([media], draft: draft, credential: credential)
+    }
+
     public func reply(_ draft: TextPost, to postID: String, credential: SocialCredential) async throws -> SocialPost {
         guard Self.validPostID(postID) else { throw SocialError.invalidInput }
         return try await createPost(draft, replyTo: postID, credential: credential)
     }
 
-    private func createPost(_ draft: TextPost, replyTo postID: String?, credential: SocialCredential) async throws -> SocialPost {
+    private func createPost(_ draft: TextPost, replyTo postID: String?, mediaIDs: [String] = [], credential: SocialCredential) async throws -> SocialPost {
         try Self.validate(credential)
-        guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !mediaIDs.isEmpty else {
             throw SocialError.invalidInput
         }
-        var payload: [String: Any] = ["text": draft.text]
+        var payload: [String: Any] = [:]
+        if !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { payload["text"] = draft.text }
         if let postID { payload["reply"] = ["in_reply_to_tweet_id": postID] }
+        if !mediaIDs.isEmpty { payload["media"] = ["media_ids": mediaIDs] }
         let response = try await requestJSON(
             Self.apiEndpoint("/2/tweets"), method: "POST", bearer: credential.accessToken,
             json: payload, publishingKey: draft.idempotencyKey
@@ -129,8 +165,37 @@ public struct XAdapter: SocialAdapter {
               Self.validPostID(created.id) else {
             throw SocialError.publishOutcomeUnknown(draft.idempotencyKey)
         }
-        return Self.post(created)
+        return Self.post(created, media: mediaIDs.map { _ in SocialAttachment(kind: .image, url: nil) })
     }
+
+    private func uploadImage(_ data: Data, contentType: String, credential: SocialCredential) async throws -> String {
+        let boundary = "SocialKit-\(UUID().uuidString)"
+        var body = Data()
+        func append(_ value: String) { body.append(contentsOf: value.utf8) }
+        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"media_category\"\r\n\r\ntweet_image\r\n")
+        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"media\"; filename=\"upload\"\r\nContent-Type: \(contentType)\r\n\r\n")
+        body.append(data)
+        append("\r\n--\(boundary)--\r\n")
+        var request = URLRequest(url: Self.apiEndpoint("/2/media/upload"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        let response = try await HTTPClient(transport: transport).send(request, classifyError: { response in
+            if response.statusCode == 402 { return .billingRequired }
+            if response.statusCode == 403 { return .permissionDenied }
+            if response.statusCode == 429 { return .rateLimited(retryAfter: response.header("Retry-After")) }
+            return nil
+        })
+        guard let result = try? Self.decode(MediaEnvelope.self, from: response.body), Self.validPostID(result.data.id) else {
+            throw SocialError.invalidResponse
+        }
+        return result.data.id
+    }
+
+    private static let maxImageBytes = 5 * 1024 * 1024
+    private static let imageTypes: Set<String> = ["image/jpeg", "image/png", "image/webp"]
 
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
         try Self.validate(credential)
@@ -152,7 +217,7 @@ public struct XAdapter: SocialAdapter {
         let response = try await requestJSON(url, bearer: credential.accessToken)
         let result = try Self.decode(PostPageEnvelope.self, from: response.body)
         guard let posts = result.data ?? (result.meta?.resultCount == 0 ? [] : nil) else { throw SocialError.invalidResponse }
-        return SocialPage(items: posts.map(Self.post), nextCursor: result.meta?.nextToken)
+        return SocialPage(items: posts.map { Self.post($0) }, nextCursor: result.meta?.nextToken)
     }
 
     /// Finds replies through recent search. X only searches the last seven days;
@@ -167,7 +232,7 @@ public struct XAdapter: SocialAdapter {
         let response = try await requestJSON(url, bearer: credential.accessToken)
         let result = try Self.decode(PostPageEnvelope.self, from: response.body)
         guard let posts = result.data ?? (result.meta?.resultCount == 0 ? [] : nil) else { throw SocialError.invalidResponse }
-        return SocialPage(items: posts.map(Self.post), nextCursor: result.meta?.nextToken)
+        return SocialPage(items: posts.map { Self.post($0) }, nextCursor: result.meta?.nextToken)
     }
 
     public func deleteReply(id: String, credential: SocialCredential) async throws {
@@ -251,7 +316,11 @@ public struct XAdapter: SocialAdapter {
         return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(seconds)))
     }
 
-    private static let scopes = ["tweet.read", "users.read", "tweet.write", "like.write", "offline.access"]
+    private static func scopes(includeMediaWrite: Bool) -> [String] {
+        var result = ["tweet.read", "users.read", "tweet.write", "like.write", "offline.access"]
+        if includeMediaWrite { result.append("media.write") }
+        return result
+    }
     private static let apiOrigin = URL(string: "https://api.x.com")!
 
     private static func apiEndpoint(_ path: String) -> URL { URL(string: path, relativeTo: apiOrigin)!.absoluteURL }
@@ -275,12 +344,15 @@ public struct XAdapter: SocialAdapter {
 
     public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
         guard credential.account.platform == .x else { return [] }
-        let scopes = credential.grantedScopes ?? Set(Self.scopes)
+        let scopes = credential.grantedScopes ?? Set(Self.scopes(includeMediaWrite: includeMediaWriteScope))
         var available: Set<SocialCapability> = []
         let canWrite = scopes.isSuperset(of: ["tweet.read", "tweet.write", "users.read"])
         let canLike = scopes.isSuperset(of: ["like.write", "tweet.read", "users.read"])
         if canWrite {
             available.formUnion([.publishText, .reply, .deleteReply, .repost, .unrepost])
+        }
+        if includeMediaWriteScope, canWrite, credential.grantedScopes?.contains("media.write") == true {
+            available.formUnion([.publishMedia, .publishMultipleMedia])
         }
         if scopes.contains("tweet.read") {
             available.formUnion([.readPost, .readReplies])
@@ -293,9 +365,9 @@ public struct XAdapter: SocialAdapter {
         return available
     }
 
-    private static func post(_ value: PostRecord) -> SocialPost {
+    private static func post(_ value: PostRecord, media: [SocialAttachment] = []) -> SocialPost {
         SocialPost(id: value.id, text: value.text, url: URL(string: "https://x.com/i/web/status/\(value.id)"),
-                   createdAt: value.createdAt, likeCount: value.publicMetrics?.likeCount)
+                   createdAt: value.createdAt, likeCount: value.publicMetrics?.likeCount, media: media)
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
@@ -321,6 +393,8 @@ public struct XAdapter: SocialAdapter {
         let deleted: Bool?
     }
     private struct PostEnvelope: Decodable { let data: PostRecord }
+    private struct MediaEnvelope: Decodable { let data: MediaRecord }
+    private struct MediaRecord: Decodable { let id: String }
     private struct PostPageEnvelope: Decodable { let data: [PostRecord]?; let meta: Meta? }
     private struct Meta: Decodable {
         let nextToken: String?

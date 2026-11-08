@@ -93,7 +93,9 @@ public actor KeychainCredentialStore: CredentialStore {
         if status == errSecItemNotFound { return nil }
         try check(status)
         guard let data = result as? Data else { throw SocialError.invalidResponse }
-        return try decode(data)
+        let credential = try decode(data)
+        guard credential.account.id == id else { throw SocialError.invalidResponse }
+        return credential
     }
 
     public func accounts() throws -> [SocialAccount] {
@@ -114,7 +116,7 @@ public actor KeychainCredentialStore: CredentialStore {
     }
 
     private func serviceQuery() throws -> [String: Any] {
-        guard !service.isEmpty else { throw SocialError.invalidConfiguration }
+        guard !service.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SocialError.invalidConfiguration }
         return [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

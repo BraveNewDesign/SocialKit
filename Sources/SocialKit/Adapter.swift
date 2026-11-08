@@ -16,6 +16,8 @@ public protocol SocialAdapter: Sendable {
     func reply(_ draft: TextPost, to postID: String, credential: SocialCredential) async throws -> SocialPost
     func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost>
     func deleteReply(id: String, credential: SocialCredential) async throws
+    func setReplyHidden(_ hidden: Bool, id: String, credential: SocialCredential) async throws
+    func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost
     func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost
     func setReposted(_ reposted: Bool, postID: String, credential: SocialCredential) async throws
 }
@@ -51,8 +53,18 @@ public extension SocialAdapter {
         throw SocialError.unsupported(.readReplies)
     }
 
+    func setReplyHidden(_ hidden: Bool, id: String, credential: SocialCredential) async throws {
+        throw SocialError.unsupported(.moderateReplies)
+    }
+
     func deleteReply(id: String, credential: SocialCredential) async throws {
         throw SocialError.unsupported(.deleteReply)
+    }
+
+    func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        guard let first = media.first else { throw SocialError.invalidInput }
+        guard media.count == 1 else { throw SocialError.unsupported(.publishMultipleMedia) }
+        return try await publishMedia(first, draft: draft, credential: credential)
     }
 
     func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {

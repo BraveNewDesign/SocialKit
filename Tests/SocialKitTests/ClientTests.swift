@@ -7,9 +7,11 @@ private let testServer = URL(string: "https://social.example")!
 private struct MockAdapter: SocialAdapter {
     let platform: SocialPlatform = .mastodon
     let capabilities: Set<SocialCapability> = [.publishText, .refreshSession]
+    var onConnect: (@Sendable () async -> Void)? = nil
     var onPublish: (@Sendable (SocialCredential) async -> Void)?
 
     func connect(_ name: String) async throws -> SocialCredential {
+        await onConnect?()
         let account = SocialAccount(platform: platform, server: testServer, remoteID: name, username: name)
         return SocialCredential(account: account, accessToken: "secret-\(name)")
     }
@@ -27,11 +29,11 @@ private struct MockAdapter: SocialAdapter {
 @Test func accountMutationIsBlockedWhilePublishing() async throws {
     let started = AsyncStream<Void>.makeStream()
     let resume = AsyncStream<Void>.makeStream()
-    let adapter = MockAdapter { credential in
+    let adapter = MockAdapter(onPublish: { credential in
         guard credential.account.remoteID == "alice" else { return }
         started.continuation.finish()
         for await _ in resume.stream {}
-    }
+    })
     let client = SocialClient(adapter: adapter, store: MemoryCredentialStore())
     let alice = try await client.connect("alice")
     let bob = try await client.connect("bob")
@@ -144,4 +146,20 @@ func rejectsNonHTTPSOrigins(value: String) throws {
     let components = try #require(URLComponents(url: endpoint, resolvingAgainstBaseURL: false))
     #expect(origin.url.absoluteString == "https://social.example")
     #expect(components.queryItems == [URLQueryItem(name: "id", value: "a&b/#")])
+}
+
+@Test(.timeLimit(.minutes(1))) func cancelledConnectionDoesNotSaveAndConcurrentConnectionIsBlocked() async throws {
+    let started = AsyncStream<Void>.makeStream()
+    let waiting = AsyncStream<Void>.makeStream()
+    let adapter = MockAdapter(onConnect: {
+        started.continuation.finish()
+        for await _ in waiting.stream {}
+    })
+    let client = SocialClient(adapter: adapter, store: MemoryCredentialStore())
+    let first = Task { try await client.connect("alice") }
+    for await _ in started.stream {}
+    await #expect(throws: SocialError.accountBusy) { try await client.connect("bob") }
+    first.cancel()
+    await #expect(throws: CancellationError.self) { try await first.value }
+    #expect(try await client.accounts().isEmpty)
 }

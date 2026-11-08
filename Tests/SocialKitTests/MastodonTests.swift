@@ -198,6 +198,27 @@ struct MastodonTests {
         #expect(transport.requests.isEmpty)
     }
 
+    @Test("Status pagination extracts a cursor without following the Link URL")
+    func paginationDoesNotFollowLinks() async throws {
+        let link = "<https://elsewhere.example/statuses?max_id=older>; rel=\"next\""
+        let transport = StubTransport([
+            HTTPResponse(statusCode: 200, headers: ["Link": link],
+                         body: Data(#"[{"id":"latest","content":"<p>Hello</p>"}]"#.utf8)),
+            json("[]")
+        ])
+        let adapter = MastodonAdapter(transport: transport)
+        let credential = makeCredential()
+        let page = try await adapter.posts(cursor: nil, credential: credential)
+        #expect(page.items.first?.textFormat == .html)
+        #expect(page.nextCursor == "older")
+        let second = try await adapter.posts(cursor: page.nextCursor, credential: credential)
+        #expect(second.nextCursor == nil)
+        let request = try #require(transport.requests.last)
+        #expect(request.url?.host == credential.account.server.host)
+        #expect(request.url?.query == "max_id=older")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer \(credential.accessToken)")
+    }
+
     private func makeCredential() -> SocialCredential {
         SocialCredential(
             account: SocialAccount(

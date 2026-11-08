@@ -25,7 +25,7 @@ public struct BlueskyAdapter: SocialAdapter {
     }
 
     public let platform: SocialPlatform = .bluesky
-    public let capabilities: Set<SocialCapability> = [.publishText, .readPost, .like, .refreshSession]
+    public let capabilities: Set<SocialCapability> = [.publishText, .readPost, .listPosts, .like, .refreshSession]
 
     private let transport: any HTTPTransport
 
@@ -135,21 +135,48 @@ public struct BlueskyAdapter: SocialAdapter {
         let reference = try Self.postReference(id, expectedDID: nil)
         let text: String
         let createdAt: String
+        let likeCount: Int?
         if reference.did == credential.account.remoteID {
             let record = try await getPostRecord(reference, origin: origin, credential: credential)
             text = record.value.text
             createdAt = record.value.createdAt
+            likeCount = nil
         } else {
             let record = try await getPublicPost(reference.uri)
             text = record.record.text
             createdAt = record.record.createdAt
+            likeCount = record.likeCount
         }
         return SocialPost(
             id: reference.uri,
             text: text,
             url: Self.webURL(did: reference.did, rkey: reference.rkey),
-            createdAt: Self.parseTimestamp(createdAt)
+            createdAt: Self.parseTimestamp(createdAt),
+            likeCount: likeCount
         )
+    }
+
+    /// Lists the account’s publicly indexed posts. AppView can lag behind the PDS.
+    public func posts(cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
+        _ = try Self.origin(for: credential)
+        let appView = try HTTPSOrigin(validating: URL(string: "https://public.api.bsky.app")!)
+        var query = [("actor", credential.account.remoteID), ("filter", "posts_with_replies")]
+        if let cursor { query.append(("cursor", cursor)) }
+        let url = try OAuthForm.queryURL(appView.endpoint("/xrpc/app.bsky.feed.getAuthorFeed"), parameters: query)
+        let response = try await requestJSON(url)
+        let page = try Self.decode(AuthorFeed.self, from: response.body)
+        let items = page.feed.compactMap { entry -> SocialPost? in
+            let post = entry.post
+            guard let reference = try? Self.postReference(post.uri, expectedDID: credential.account.remoteID) else {
+                return nil
+            }
+            return SocialPost(
+                id: post.uri, text: post.record.text,
+                url: Self.webURL(did: reference.did, rkey: reference.rkey),
+                createdAt: Self.parseTimestamp(post.record.createdAt), likeCount: post.likeCount
+            )
+        }
+        return SocialPage(items: items, nextCursor: page.cursor == cursor ? nil : page.cursor)
     }
 
     public func setLiked(_ liked: Bool, postID: String, credential: SocialCredential) async throws {
@@ -327,6 +354,11 @@ public struct BlueskyAdapter: SocialAdapter {
         let value: PostRecord
     }
     private struct PostRecord: Decodable { let text: String; let createdAt: String }
+    private struct AuthorFeed: Decodable {
+        struct Entry: Decodable { let post: AppViewPost }
+        let feed: [Entry]
+        let cursor: String?
+    }
     private struct AppViewResponse: Decodable { let posts: [AppViewPost] }
     private struct AppViewPost: Decodable {
         let uri: String

@@ -173,6 +173,23 @@ struct BlueskyTests {
         #expect(transport.requests.isEmpty)
     }
 
+    @Test("Author feed pagination uses AppView without sending credentials")
+    func authorFeedIsPublic() async throws {
+        let transport = StubTransport([
+            json(#"{"feed":[{"post":{"uri":"at://did:plc:alice123/app.bsky.feed.post/3jzfcijpj2z2a","cid":"fixture","record":{"text":"Hello","createdAt":"2026-11-08T11:00:00Z"},"likeCount":7}}],"cursor":"a+b"}"#),
+            json(#"{"feed":[]}"#)
+        ])
+        let adapter = BlueskyAdapter(transport: transport)
+        let first = try await adapter.posts(cursor: nil, credential: makeCredential())
+        #expect(first.items.first?.likeCount == 7)
+        #expect(first.nextCursor == "a+b")
+        _ = try await adapter.posts(cursor: first.nextCursor, credential: makeCredential())
+        #expect(transport.requests.allSatisfy {
+            $0.url?.host == "public.api.bsky.app" && $0.value(forHTTPHeaderField: "Authorization") == nil
+        })
+        #expect(transport.requests.last?.url?.absoluteString.contains("cursor=a%2Bb") == true)
+    }
+
     private func makeCredential() -> SocialCredential {
         SocialCredential(
             account: SocialAccount(platform: .bluesky, server: server, remoteID: did, username: "alice.example"),

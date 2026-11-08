@@ -40,7 +40,7 @@ public struct LinkedInAdapter: SocialAdapter {
     public var capabilities: Set<SocialCapability> {
         var supported: Set<SocialCapability> = [
             .publishText, .publishMedia, .readPost, .listPosts, .like, .unlike,
-            .reply, .readReplies
+            .reply, .readReplies, .publishMultipleMedia
         ]
         if oauthBroker != nil { supported.insert(.refreshSession) }
         return supported
@@ -71,7 +71,7 @@ public struct LinkedInAdapter: SocialAdapter {
         let feedWriteScope = authorIsOrganization ? "w_organization_social_feed" : "w_member_social_feed"
         let feedReadScope = authorIsOrganization ? "r_organization_social_feed" : "r_member_social_feed"
         if !scopes.contains(writeScope) {
-            result.subtract([.publishText, .publishMedia])
+            result.subtract([.publishText, .publishMedia, .publishMultipleMedia])
         }
         if !scopes.contains(readScope) { result.subtract([.readPost, .listPosts]) }
         if !scopes.contains(feedWriteScope) { result.subtract([.reply, .like, .unlike]) }
@@ -175,12 +175,8 @@ public struct LinkedInAdapter: SocialAdapter {
         try validate(credential)
         try require(.publishMedia, credential)
         try Self.validateText(draft.text)
-        guard case let .imageData(bytes, contentType) = media,
-              ["image/jpeg", "image/png", "image/gif"].contains(contentType.lowercased()),
-              !bytes.isEmpty, bytes.count <= 20 * 1024 * 1024 else {
-            throw SocialError.invalidInput
-        }
-        let imageURN = try await uploadImage(bytes, contentType: contentType.lowercased(), credential: credential)
+        let image = try Self.imagePayload(media)
+        let imageURN = try await uploadImage(image.bytes, contentType: image.contentType, credential: credential)
         try await verifyImageAvailableIfReadable(imageURN, credential: credential)
         let id = try await createPost(
             draft,
@@ -189,6 +185,34 @@ public struct LinkedInAdapter: SocialAdapter {
         )
         return SocialPost(id: id, text: draft.text, url: Self.postURL(id), createdAt: .now,
                           media: [SocialAttachment(kind: .image, url: nil)])
+    }
+
+    /// Publishes an organic MultiImage post. LinkedIn requires 2–20 Images API assets owned by
+    /// the author; validate the complete batch before making the first upload request.
+    public func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try validate(credential)
+        guard media.count >= 2, media.count <= 20 else { throw SocialError.invalidInput }
+        try require(.publishMultipleMedia, credential)
+        try Self.validateText(draft.text)
+        let images = try media.map(Self.imagePayload)
+
+        var imageURNs: [String] = []
+        imageURNs.reserveCapacity(images.count)
+        for image in images {
+            let urn = try await uploadImage(image.bytes, contentType: image.contentType, credential: credential)
+            try await verifyImageAvailableIfReadable(urn, credential: credential)
+            imageURNs.append(urn)
+        }
+
+        let id = try await createPost(
+            draft,
+            credential: credential,
+            content: ["multiImage": ["images": imageURNs.map { ["id": $0] }]]
+        )
+        return SocialPost(
+            id: id, text: draft.text, url: Self.postURL(id), createdAt: .now,
+            media: imageURNs.map { _ in SocialAttachment(kind: .image, url: nil) }
+        )
     }
 
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
@@ -296,13 +320,17 @@ public struct LinkedInAdapter: SocialAdapter {
             body: ["initializeUploadRequest": ["owner": credential.account.remoteID]]
         )
         let upload = try Self.decode(UploadEnvelope.self, from: initialized.body).value
-        guard Self.validImageURN(upload.image), let url = URL(string: upload.uploadUrl), Self.validUploadURL(url) else {
+        guard Self.validImageURN(upload.image), let url = URL(string: upload.uploadUrl), Self.validUploadURL(url),
+              let expiresAt = upload.uploadUrlExpiresAt,
+              expiresAt > Date.now.timeIntervalSince1970 * 1_000 else {
             throw SocialError.invalidResponse
         }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
-        request.httpBody = bytes
+        // The Images API links to the authenticated upload contract. The URL
+        // has already passed the LinkedIn host and path allowlist.
         request.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = bytes
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         _ = try await HTTPClient(transport: transport).send(request)
         return upload.image
@@ -471,7 +499,8 @@ public struct LinkedInAdapter: SocialAdapter {
     }
     private static func socialPost(_ post: LinkedInPost) -> SocialPost {
         SocialPost(id: post.id, text: post.commentary ?? "", url: postURL(post.id),
-                   createdAt: post.publishedAt.map { Date(timeIntervalSince1970: $0 / 1_000) }, likeCount: nil)
+                   createdAt: post.publishedAt.map { Date(timeIntervalSince1970: $0 / 1_000) }, likeCount: nil,
+                   media: post.imageIDs.map { _ in SocialAttachment(kind: .image, url: nil) })
     }
     private static func socialPost(_ comment: LinkedInComment) -> SocialPost {
         SocialPost(id: comment.commentUrn, text: comment.message.text,
@@ -479,6 +508,14 @@ public struct LinkedInAdapter: SocialAdapter {
     }
     private static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do { return try JSONDecoder().decode(type, from: data) } catch { throw SocialError.invalidResponse }
+    }
+    private static func imagePayload(_ media: SocialMedia) throws -> (bytes: Data, contentType: String) {
+        guard case let .imageData(bytes, contentType) = media,
+              ["image/jpeg", "image/png", "image/gif"].contains(contentType.lowercased()),
+              !bytes.isEmpty, bytes.count <= 20 * 1024 * 1024 else {
+            throw SocialError.invalidInput
+        }
+        return (bytes, contentType.lowercased())
     }
     private static func classify(_ response: HTTPResponse) -> SocialError? {
         switch response.statusCode {
@@ -495,7 +532,20 @@ public struct LinkedInAdapter: SocialAdapter {
 }
 
 private struct UserInfo: Decodable { let sub: String; let name: String? }
-private struct LinkedInPost: Decodable { let id: String; let author: String; let commentary: String?; let publishedAt: Double? }
+private struct LinkedInPost: Decodable {
+    let id: String
+    let author: String
+    let commentary: String?
+    let publishedAt: Double?
+    let content: PostContent?
+
+    var imageIDs: [String] {
+        (content?.multiImage?.images.map(\.id) ?? []) + (content?.media.map { [$0.id] } ?? [])
+    }
+}
+private struct PostContent: Decodable { let media: PostMedia?; let multiImage: PostMultiImage? }
+private struct PostMedia: Decodable { let id: String }
+private struct PostMultiImage: Decodable { let images: [PostMedia] }
 private struct PostsResponse: Decodable { let elements: [LinkedInPost]; let paging: Paging? }
 private struct Paging: Decodable {
     struct Link: Decodable {
@@ -520,7 +570,7 @@ private struct Paging: Decodable {
     }
 }
 private struct UploadEnvelope: Decodable { let value: UploadValue }
-private struct UploadValue: Decodable { let uploadUrl: String; let image: String }
+private struct UploadValue: Decodable { let uploadUrl: String; let image: String; let uploadUrlExpiresAt: Double? }
 private struct ImageStatus: Decodable { let id: String; let owner: String?; let status: String }
 private struct CommentResponse: Decodable { let commentUrn: String }
 private struct OrganizationACLResponse: Decodable { let elements: [OrganizationACL]; let paging: Paging? }

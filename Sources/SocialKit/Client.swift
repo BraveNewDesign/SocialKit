@@ -5,6 +5,7 @@ public actor SocialClient<Adapter: SocialAdapter> {
     private let adapter: Adapter
     private let store: any CredentialStore
     private var busyAccounts: Set<SocialAccount.ID> = []
+    private var connecting = false
 
     public nonisolated var platform: SocialPlatform { adapter.platform }
     public nonisolated var capabilities: Set<SocialCapability> { adapter.capabilities }
@@ -15,7 +16,13 @@ public actor SocialClient<Adapter: SocialAdapter> {
     }
 
     public func connect(_ authorization: Adapter.Authorization) async throws -> SocialAccount {
+        try Task.checkCancellation()
+        guard !connecting else { throw SocialError.accountBusy }
+        connecting = true
+        defer { connecting = false }
         let credential = try await adapter.connect(authorization)
+        try Task.checkCancellation()
+        guard !credential.accessToken.isEmpty else { throw SocialError.invalidResponse }
         let id = credential.account.id
         try begin(id)
         defer { busyAccounts.remove(id) }
@@ -39,7 +46,7 @@ public actor SocialClient<Adapter: SocialAdapter> {
     public func refresh(_ id: SocialAccount.ID) async throws -> SocialAccount {
         try await withCredential(id, requiring: .refreshSession) { credential in
             let renewed = try await adapter.refresh(credential)
-            guard renewed.account.id == id else { throw SocialError.invalidResponse }
+            guard renewed.account.id == id, !renewed.accessToken.isEmpty else { throw SocialError.invalidResponse }
             try await store.save(renewed)
             return renewed.account
         }
@@ -91,6 +98,12 @@ public actor SocialClient<Adapter: SocialAdapter> {
         }
     }
 
+    public func setReplyHidden(_ hidden: Bool, id replyID: String, as account: SocialAccount.ID) async throws {
+        try await withCredential(account, requiring: .moderateReplies) { credential in
+            try await adapter.setReplyHidden(hidden, id: replyID, credential: credential)
+        }
+    }
+
     public func deleteReply(id replyID: String, as account: SocialAccount.ID) async throws {
         try await withCredential(account, requiring: .deleteReply) { credential in
             try await adapter.deleteReply(id: replyID, credential: credential)
@@ -101,6 +114,16 @@ public actor SocialClient<Adapter: SocialAdapter> {
         _ media: SocialMedia, draft: TextPost, as id: SocialAccount.ID
     ) async throws -> SocialPost {
         try await withCredential(id, requiring: .publishMedia) { credential in
+            try await adapter.publishMedia(media, draft: draft, credential: credential)
+        }
+    }
+
+    public func publishMedia(
+        _ media: [SocialMedia], draft: TextPost, as id: SocialAccount.ID
+    ) async throws -> SocialPost {
+        guard let first = media.first else { throw SocialError.invalidInput }
+        if media.count == 1 { return try await publishMedia(first, draft: draft, as: id) }
+        return try await withCredential(id, requiring: .publishMultipleMedia) { credential in
             try await adapter.publishMedia(media, draft: draft, credential: credential)
         }
     }
@@ -121,6 +144,7 @@ public actor SocialClient<Adapter: SocialAdapter> {
         requiring capability: SocialCapability,
         operation: @Sendable (SocialCredential) async throws -> Result
     ) async throws -> Result {
+        try Task.checkCancellation()
         guard capabilities.contains(capability) else { throw SocialError.unsupported(capability) }
         try begin(id)
         defer { busyAccounts.remove(id) }
@@ -135,6 +159,7 @@ public actor SocialClient<Adapter: SocialAdapter> {
         if capability != .refreshSession, let expiresAt = credential.expiresAt, expiresAt <= Date() {
             throw SocialError.authenticationRequired
         }
+        try Task.checkCancellation()
         return try await operation(credential)
     }
 }

@@ -17,11 +17,13 @@ public enum SocialCapability: String, Sendable, CaseIterable {
     case unlike
     case refreshSession
     case publishMedia
+    case publishMultipleMedia
     case analytics
     case listPosts
     case reply
     case readReplies
     case deleteReply
+    case moderateReplies
     case repost
     case unrepost
 }
