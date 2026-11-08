@@ -1,0 +1,228 @@
+import Foundation
+
+public struct ThreadsAuthorization: Sendable {
+    public let clientID: String
+    public let redirectURI: URL
+    public let scopes: Set<String>
+    public let browser: OAuthBrowser
+    public let exchange: any ConfidentialOAuthExchange
+
+    public init(
+        clientID: String,
+        redirectURI: URL,
+        scopes: Set<String> = ["threads_basic", "threads_content_publish", "threads_read_replies", "threads_manage_replies", "threads_delete"],
+        browser: @escaping OAuthBrowser,
+        exchange: any ConfidentialOAuthExchange
+    ) {
+        self.clientID = clientID
+        self.redirectURI = redirectURI
+        self.scopes = scopes
+        self.browser = browser
+        self.exchange = exchange
+    }
+}
+
+/// Meta Threads API adapter. The callback code is exchanged by the host application's trusted service.
+/// Endpoints and required scopes checked 2026-11-08 against Meta's official collection and docs:
+/// https://developers.facebook.com/documentation/threads/threads-posts
+/// https://developers.facebook.com/documentation/threads/retrieve-and-manage-replies/create-replies
+/// https://developers.facebook.com/documentation/threads/posts/reposts
+/// Long-lived token refresh requires an unexpired token; Meta's documented endpoint takes the
+/// token as a query parameter: https://developers.facebook.com/docs/threads/long-lived-tokens/
+public struct ThreadsAdapter: SocialAdapter {
+    public typealias Authorization = ThreadsAuthorization
+    public let platform: SocialPlatform = .threads
+    public let capabilities: Set<SocialCapability> = [
+        .publishText, .readPost, .listPosts, .reply, .readReplies, .deleteReply,
+        .publishMedia, .repost, .refreshSession
+    ]
+
+    private let transport: any HTTPTransport
+    private let origin = URL(string: "https://graph.threads.net/v1.0")!
+    private let accountServer = URL(string: "https://graph.threads.net")!
+    private let pollAttempts: Int
+    private let pollIntervalNanoseconds: UInt64
+
+    public init(
+        transport: any HTTPTransport = URLSessionTransport(),
+        pollAttempts: Int = 5,
+        pollIntervalNanoseconds: UInt64 = 60_000_000_000
+    ) {
+        self.transport = transport
+        self.pollAttempts = max(1, pollAttempts)
+        self.pollIntervalNanoseconds = pollIntervalNanoseconds
+    }
+
+    public func connect(_ authorization: ThreadsAuthorization) async throws -> SocialCredential {
+        guard !authorization.clientID.isEmpty, !authorization.scopes.isEmpty else { throw SocialError.invalidConfiguration }
+        let transaction = try OAuthTransaction(redirectURI: authorization.redirectURI)
+        let authURL = try OAuthForm.queryURL(URL(string: "https://threads.net/oauth/authorize")!, parameters: [
+            ("client_id", authorization.clientID),
+            ("redirect_uri", authorization.redirectURI.absoluteString),
+            ("scope", authorization.scopes.sorted().joined(separator: ",")),
+            ("response_type", "code"),
+            ("state", transaction.state)
+        ])
+        let callback = try await authorization.browser(authURL, authorization.redirectURI)
+        let code = try transaction.code(from: callback)
+        let token = try await authorization.exchange.exchange(platform: .threads, code: code, redirectURI: authorization.redirectURI)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: token.accessToken)
+        let profile: ThreadsProfile = try await api.get("/me", query: [("fields", "id,username")])
+        guard !profile.id.isEmpty else { throw SocialError.invalidResponse }
+        let account = SocialAccount(platform: .threads, server: accountServer, remoteID: profile.id, username: profile.username)
+        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
+                               expiresAt: token.expiresAt, grantedScopes: token.grantedScopes ?? authorization.scopes)
+    }
+
+    public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
+        try validate(credential)
+        if let expiry = credential.expiresAt, expiry <= Date() { throw SocialError.authenticationRequired }
+        let api = try MetaHTTP(transport: transport, origin: accountServer, accessToken: credential.accessToken)
+        let value: MetaRefreshResponse = try await api.get("/refresh_access_token", query: [
+            ("grant_type", "th_refresh_token"), ("access_token", credential.accessToken)
+        ])
+        guard !value.access_token.isEmpty, value.expires_in > 0 else { throw SocialError.invalidResponse }
+        return SocialCredential(account: credential.account, accessToken: value.access_token,
+                                refreshToken: credential.refreshToken,
+                                expiresAt: Date().addingTimeInterval(TimeInterval(value.expires_in)),
+                                grantedScopes: credential.grantedScopes)
+    }
+
+    public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
+        guard let scopes = credential.grantedScopes else { return capabilities }
+        var result = capabilities
+        guard scopes.contains("threads_basic") else { return [] }
+        if !scopes.contains("threads_content_publish") { result.remove(.publishText); result.remove(.publishMedia); result.remove(.reply); result.remove(.repost) }
+        if !scopes.contains("threads_read_replies") { result.remove(.readReplies) }
+        if !scopes.contains("threads_manage_replies") { result.remove(.reply) }
+        if !scopes.contains("threads_delete") { result.remove(.deleteReply) }
+        return result
+    }
+
+    public func publish(_ draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try await publishContainer(media: nil, draft: draft, credential: credential)
+    }
+
+    public func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try await publishContainer(media: media, draft: draft, credential: credential)
+    }
+
+    private func publishContainer(media: SocialMedia?, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try validate(credential)
+        let textLength = draft.text.unicodeScalars.reduce(0) { partial, scalar in partial + (scalar.value > 0xFFFF ? 4 : 1) }
+        guard textLength <= 500, media != nil || !draft.text.isEmpty else { throw SocialError.invalidInput }
+        let id = try metaPathID(credential.account.remoteID)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        var form: [(String, String)] = [("media_type", "TEXT"), ("text", draft.text)]
+        switch media {
+        case nil: break
+        case .imageURL(let url):
+            try requireHTTPS(url); form = [("media_type", "IMAGE"), ("image_url", url.absoluteString), ("text", draft.text)]
+        case .videoURL(let url):
+            try requireHTTPS(url); form = [("media_type", "VIDEO"), ("video_url", url.absoluteString), ("text", draft.text)]
+        case .imageData: throw SocialError.invalidInput // Threads fetches public URLs; binary upload is not available in this contract.
+        }
+        let container: MetaID = try await api.post("/\(id)/threads", form: form, key: draft.idempotencyKey)
+        let ready = try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey)
+        guard ready else { throw SocialError.mediaProcessingTimedOut }
+        let result: MetaID = try await api.post("/\(id)/threads_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        return SocialPost(id: result.id, text: draft.text, media: socialAttachments(for: media))
+    }
+
+    private func waitForContainer(_ id: String, api: MetaHTTP, publishingKey: UUID) async throws -> Bool {
+        let path = "/\(try metaPathID(id))"
+        for attempt in 0..<pollAttempts {
+            let status: ThreadsContainerStatus = try await api.get(path, query: [("fields", "id,status,error_message")])
+            switch status.status {
+            case "FINISHED": return true
+            case "PUBLISHED": throw SocialError.publishOutcomeUnknown(publishingKey)
+            case "ERROR", "EXPIRED": throw SocialError.mediaProcessingFailed
+            case "IN_PROGRESS": break
+            default: throw SocialError.invalidResponse
+            }
+            if attempt + 1 < pollAttempts, pollIntervalNanoseconds > 0 {
+                try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+            }
+        }
+        return false
+    }
+
+    public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
+        try validate(credential)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let value: MetaPostRecord = try await api.get("/\(try metaPathID(id))", query: [("fields", Self.postFields)])
+        return metaPost(value)
+    }
+
+    public func posts(cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
+        try validate(credential)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        var query = [("fields", Self.postFields)]
+        if let cursor { query.append(("after", cursor)) }
+        let value: MetaPageResponse<MetaPostRecord> = try await api.get("/\(try metaPathID(credential.account.remoteID))/threads", query: query)
+        return SocialPage(items: value.data.map(metaPost), nextCursor: value.paging?.next == nil ? nil : value.paging?.cursors?.after)
+    }
+
+    public func reply(_ draft: TextPost, to postID: String, credential: SocialCredential) async throws -> SocialPost {
+        try validate(credential)
+        guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SocialError.invalidInput }
+        let owner = try metaPathID(credential.account.remoteID)
+        let target = try metaPathID(postID)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let container: MetaID = try await api.post("/\(owner)/threads", form: [
+            ("media_type", "TEXT"), ("text", draft.text), ("reply_to_id", target)
+        ], key: draft.idempotencyKey)
+        guard try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
+        let result: MetaID = try await api.post("/\(owner)/threads_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        return SocialPost(id: result.id, text: draft.text)
+    }
+
+    public func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
+        try validate(credential)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        var query = [("fields", "id,text,username,timestamp,permalink,media_type,media_url")]
+        if let cursor { query.append(("after", cursor)) }
+        let value: MetaPageResponse<MetaPostRecord> = try await api.get("/\(try metaPathID(postID))/replies", query: query)
+        return SocialPage(items: value.data.map(metaPost), nextCursor: value.paging?.next == nil ? nil : value.paging?.cursors?.after)
+    }
+
+    public func deleteReply(id: String, credential: SocialCredential) async throws {
+        try validate(credential)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        try await api.delete("/\(try metaPathID(id))")
+    }
+
+    public func setReposted(_ reposted: Bool, postID: String, credential: SocialCredential) async throws {
+        guard reposted else { throw SocialError.unsupported(.unrepost) }
+        try validate(credential)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let result: MetaID = try await api.post("/\(try metaPathID(postID))/repost", form: [])
+        guard !result.id.isEmpty else { throw SocialError.invalidResponse }
+    }
+
+    private func validate(_ credential: SocialCredential) throws {
+        guard credential.account.platform == .threads, credential.account.server == accountServer else { throw SocialError.invalidConfiguration }
+        guard !credential.accessToken.isEmpty else { throw SocialError.authenticationRequired }
+    }
+
+    private func requireHTTPS(_ url: URL) throws {
+        guard url.scheme?.lowercased() == "https", url.host != nil, url.user == nil, url.password == nil else {
+            throw SocialError.invalidInput
+        }
+    }
+
+    private static let postFields = "id,text,permalink,timestamp,media_type,media_url"
+}
+
+private struct ThreadsProfile: Decodable, Sendable { let id: String; let username: String }
+private struct ThreadsContainerStatus: Decodable, Sendable { let id: String; let status: String }
+private struct MetaRefreshResponse: Decodable, Sendable { let access_token: String; let expires_in: Int }
+
+private func socialAttachments(for media: SocialMedia?) -> [SocialAttachment] {
+    switch media {
+    case nil: return []
+    case .imageURL(let url): return [SocialAttachment(kind: .image, url: url)]
+    case .videoURL(let url): return [SocialAttachment(kind: .video, url: url)]
+    case .imageData: return []
+    }
+}
