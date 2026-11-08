@@ -34,3 +34,5 @@ let account = try await client.connect(.init(identifier: "demo.example", appPass
 let draft = TextPost(text: "Hello from SocialKit")
 let published = try await client.publish(draft, as: account.id)
 print("Simulated publish by \(account.username): \(published.id)")
+
+try await runExpansionExamples()

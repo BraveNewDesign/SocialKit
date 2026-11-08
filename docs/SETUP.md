@@ -84,3 +84,11 @@ Create and persist one `TextPost` per intent before sending it. Retain the accou
 - **Mastodon.** The adapter sends the draft UUID as `Idempotency-Key`. Mastodon can retain keys for up to one hour. Check the account’s recent posts after an ambiguous result. A same-key resubmission may create a duplicate if the provider has forgotten the key. [Mastodon status creation](https://docs.joinmastodon.org/methods/statuses/#create).
 
 Operations on different accounts can run concurrently. Calls that overlap for the same account through one client can return `accountBusy`. Refresh and reconnect may rotate credentials, so use that client for account mutations.
+
+## Threads, Facebook Pages, Instagram, LinkedIn, and X
+
+Run `swift run SocialKitExample` for credential-free sign-in and publishing examples. The example uses `HTTPTransport`, `OAuthBrowser`, and `ConfidentialOAuthExchange` fixtures. In a host app, select the provider and connection type documented in [Platform setup and capabilities](PLATFORMS.md).
+
+Pass `SocialPage.nextCursor` back to the same account and operation until it is absent. Treat cursors as opaque. Capabilities reflect the adapter and known grants. The provider can still reject an action based on roles, account state, or product access.
+
+The added providers have no SDK-level create idempotency guarantee. A draft UUID correlates a `publishOutcomeUnknown` error with the original user action. For a multi-step publish, a failed processing check can leave an unpublished container. A timeout or malformed response on the final publish can leave a published post. Check the provider feed before sending another create.

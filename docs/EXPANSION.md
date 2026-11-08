@@ -1,6 +1,6 @@
 # SocialKit expansion: platform support and architecture
 
-**Research snapshot: 2026-11-08.** This is a platform feasibility brief for a native Swift SDK. Platform API access is conditional: an SDK cannot confer API product access, app review approval, account eligibility, or permission grants. Recheck provider docs and console requirements before shipping each adapter.
+**Pre-implementation research snapshot: 2026-11-08.** See [Platform setup and capabilities](PLATFORMS.md) for the implemented surface. This is a platform feasibility brief for a native Swift SDK. Platform API access is conditional: an SDK cannot confer API product access, app review approval, account eligibility, or permission grants. Recheck provider docs and console requirements before shipping each adapter.
 
 ## Recommendation
 

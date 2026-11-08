@@ -9,3 +9,5 @@ SocialKit is MIT licensed and has no third-party Swift package dependencies or v
 | [TootSDK](https://github.com/TootSDK/TootSDK) | BSD-3-Clause. The repository has recent [versioned releases](https://github.com/TootSDK/TootSDK/releases). | It provides broad Fediverse API coverage. The initial Mastodon surface is small and the SDK owns the S256/state callback checks and publishing semantics. Reevaluate for media or wider Fediverse support. |
 
 Provider request and response formats follow the [Bluesky API docs](https://docs.bsky.app/docs/api) and the [Mastodon API docs](https://docs.joinmastodon.org/methods/). The CI workflow uses GitHub’s [checkout action](https://github.com/actions/checkout) (MIT), a build-time tool.
+
+The expanded adapters also consulted the OpenCore Social SDK's [Threads, Facebook, Instagram, LinkedIn, and X reference adapters](https://github.com/opencoredev/social-sdk/tree/410cb17/packages/social-sdk/src/platforms). The implementations are native Swift and follow provider wire formats. No reference code or dependencies are bundled.
