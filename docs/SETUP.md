@@ -92,3 +92,24 @@ Run `swift run SocialKitExample` for credential-free sign-in and publishing exam
 Pass `SocialPage.nextCursor` back to the same account and operation until it is absent. Treat cursors as opaque. Capabilities reflect the adapter and known grants. The provider can still reject an action based on roles, account state, or product access.
 
 The added providers have no SDK-level create idempotency guarantee. A draft UUID correlates a `publishOutcomeUnknown` error with the original user action. For a multi-step publish, a failed processing check can leave an unpublished container. A timeout or malformed response on the final publish can leave a published post. Check the provider feed before sending another create.
+
+## Optional SwiftUI components
+
+Link `SocialKitUI` alongside `SocialKit`. The connection view takes your existing `SocialClient.connect` closure, so the host owns account selection, app registration and the authentication browser. The publishing form accepts a text binding, the selected attachments, and `try await client.capabilities(for: account.id)`. Set the form’s view identity to the selected account ID when switching accounts so an earlier result stays with its account.
+
+```swift
+import SocialKit
+import SocialKitUI
+import SwiftUI
+
+// In a view with a selected account and its capabilities:
+SocialPublishForm(text: $text, media: attachments, capabilities: capabilities) { draft, media in
+    if media.isEmpty {
+        return try await client.publish(draft, as: account.id)
+    }
+    return try await client.publishMedia(media, draft: draft, as: account.id)
+}
+.id(account.id)
+```
+
+`SocialConnectionButton` reports progress and a connected account. Both controls cancel their pending task when dismissed. The publishing form stops further submissions after an uncertain write until the person acknowledges they checked the provider. The host can save the draft in its publishing closure for reconciliation after relaunch.

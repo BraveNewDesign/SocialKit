@@ -26,13 +26,28 @@ struct DemoTransport: HTTPTransport {
     }
 }
 
-let client = SocialClient(
-    adapter: BlueskyAdapter(transport: DemoTransport()),
-    store: MemoryCredentialStore()
-)
-let account = try await client.connect(.init(identifier: "demo.example", appPassword: "fixture-only"))
-let draft = TextPost(text: "Hello from SocialKit")
-let published = try await client.publish(draft, as: account.id)
-print("Simulated publish by \(account.username): \(published.id)")
+let arguments = Array(CommandLine.arguments.dropFirst())
+if arguments == ["--help"] {
+    print("swift run SocialKitExample [--platform <name>]")
+    print(SocialPlatform.allCases.map(\.rawValue).joined(separator: ", "))
+} else {
+    let platform: SocialPlatform?
+    switch arguments.count {
+    case 0:
+        platform = nil
+    case 2 where arguments[0] == "--platform":
+        guard let selected = SocialPlatform(rawValue: arguments[1]) else { throw SocialError.invalidInput }
+        platform = selected
+    default:
+        throw SocialError.invalidInput
+    }
 
-try await runExpansionExamples()
+    if platform == nil || platform == .bluesky {
+        let client = SocialClient(adapter: BlueskyAdapter(transport: DemoTransport()), store: MemoryCredentialStore())
+        let account = try await client.connect(.init(identifier: "demo.example", appPassword: "fixture-only"))
+        let published = try await client.publish(TextPost(text: "Hello from SocialKit"), as: account.id)
+        print("Simulated Bluesky publish by \(account.username): \(published.id)")
+    }
+
+    try await runExpansionExamples(platform: platform)
+}
