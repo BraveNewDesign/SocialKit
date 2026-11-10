@@ -8,17 +8,21 @@ public struct OAuthToken: Codable, Sendable, CustomStringConvertible, CustomDebu
     public let refreshToken: String?
     public let expiresAt: Date?
     public let grantedScopes: Set<String>?
+    /// Present only for confirmed long-lived Instagram and Threads credentials.
+    public let metaLongLivedRefreshEligibleAt: Date?
 
     public init(
         accessToken: String,
         refreshToken: String? = nil,
         expiresAt: Date? = nil,
-        grantedScopes: Set<String>? = nil
+        grantedScopes: Set<String>? = nil,
+        metaLongLivedRefreshEligibleAt: Date? = nil
     ) {
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
         self.grantedScopes = grantedScopes
+        self.metaLongLivedRefreshEligibleAt = metaLongLivedRefreshEligibleAt
     }
 
     public var description: String { "OAuthToken(redacted)" }
@@ -38,14 +42,16 @@ public extension ConfidentialOAuthExchange {
     }
 }
 
+/// A broker that registers a Meta authorization attempt before the browser is opened.
+/// Create one exchange instance per attempt. An implementation must bind the state,
+/// client ID, provider, and exact redirect URI to a short-lived, single-use session.
+public protocol SessionBoundMetaOAuthExchange: ConfidentialOAuthExchange {
+    func prepare(platform: SocialPlatform, clientID: String, redirectURI: URL, state: String) async throws
+}
+
 struct OAuthTransaction: Sendable {
     let state = Self.randomString()
-    let verifier = Self.randomString()
     let redirectURI: URL
-
-    var challenge: String {
-        Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
-    }
 
     init(redirectURI: URL) throws {
         guard let components = URLComponents(url: redirectURI, resolvingAgainstBaseURL: false),
@@ -81,15 +87,23 @@ struct OAuthTransaction: Sendable {
         return code
     }
 
-    private static func randomString() -> String {
+    fileprivate static func randomString() -> String {
         base64URL(Data((0..<32).map { _ in UInt8.random(in: .min ... .max) }))
     }
 
-    private static func base64URL(_ data: Data) -> String {
+    fileprivate static func base64URL(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+}
+
+struct OAuthPKCE: Sendable {
+    let verifier = OAuthTransaction.randomString()
+
+    var challenge: String {
+        OAuthTransaction.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
     }
 }
 

@@ -39,6 +39,7 @@ public struct MastodonAdapter: SocialAdapter {
     public func connect(_ authorization: Authorization) async throws -> SocialCredential {
         let origin = try HTTPSOrigin(validating: authorization.server)
         let transaction = try OAuthTransaction(redirectURI: authorization.redirectURI)
+        let pkce = OAuthPKCE()
         guard !authorization.applicationName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw SocialError.invalidConfiguration
         }
@@ -78,7 +79,7 @@ public struct MastodonAdapter: SocialAdapter {
             ("redirect_uri", authorization.redirectURI.absoluteString),
             ("scope", scopes),
             ("state", transaction.state),
-            ("code_challenge", transaction.challenge),
+            ("code_challenge", pkce.challenge),
             ("code_challenge_method", "S256"),
             ("force_login", authorization.forceLogin ? "true" : "false")
         ])
@@ -94,7 +95,7 @@ public struct MastodonAdapter: SocialAdapter {
                 ("client_id", app.clientID),
                 ("client_secret", app.clientSecret),
                 ("redirect_uri", authorization.redirectURI.absoluteString),
-                ("code_verifier", transaction.verifier)
+                ("code_verifier", pkce.verifier)
             ]
         )
         let token = try Self.decode(Token.self, from: tokenResponse.body)

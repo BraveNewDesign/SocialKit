@@ -21,6 +21,11 @@ public actor SocialClient<Adapter: SocialAdapter> {
         connecting = true
         defer { connecting = false }
         let credential = try await adapter.connect(authorization)
+        return try await saveVerifiedCredential(credential)
+    }
+
+    /// Save an adapter-verified credential using the same account lock as refresh and delivery.
+    public func saveVerifiedCredential(_ credential: SocialCredential) async throws -> SocialAccount {
         try Task.checkCancellation()
         guard !credential.accessToken.isEmpty else { throw SocialError.invalidResponse }
         let id = credential.account.id
@@ -47,6 +52,7 @@ public actor SocialClient<Adapter: SocialAdapter> {
         try await withCredential(id, requiring: .refreshSession) { credential in
             let renewed = try await adapter.refresh(credential)
             guard renewed.account.id == id, !renewed.accessToken.isEmpty else { throw SocialError.invalidResponse }
+            try Task.checkCancellation()
             try await store.save(renewed)
             return renewed.account
         }
@@ -134,10 +140,51 @@ public actor SocialClient<Adapter: SocialAdapter> {
         }
     }
 
+    /// Continue polling a staged Meta post or stage a new one and persist its receipt.
+    /// A checkpoint that recorded a publish attempt can only be reconciled, never resubmitted.
+    public func publishCheckpointedMetaPost(
+        _ media: [SocialMedia], draft: TextPost, as id: SocialAccount.ID,
+        checkpoint: MetaPublishingCheckpoint?, save: @escaping MetaPublishingCheckpointWriter
+    ) async throws -> SocialPost {
+        let capability: SocialCapability = media.isEmpty ? .publishText
+            : media.count == 1 ? .publishMedia : .publishMultipleMedia
+        guard let adapter = adapter as? any MetaCheckpointPublishing else { throw SocialError.unsupported(capability) }
+        return try await withCredential(id, requiring: capability) { credential in
+            try await adapter.publishCheckpointed(media, draft: draft, credential: credential,
+                                                  checkpoint: checkpoint, save: save)
+        }
+    }
+
+    /// Read-only reconciliation. A confirmed publish may have no recoverable post ID.
+    public func wasMetaContainerPublished(
+        _ checkpoint: MetaPublishingCheckpoint, as id: SocialAccount.ID
+    ) async throws -> Bool {
+        guard let adapter = adapter as? any MetaCheckpointPublishing else { throw SocialError.unsupported(.readPost) }
+        return try await withCredential(id, requiring: .readPost) { credential in
+            try await adapter.wasPublished(checkpoint, credential: credential)
+        }
+    }
+
     public func setReposted(_ reposted: Bool, postID: String, as id: SocialAccount.ID) async throws {
         try await withCredential(id, requiring: reposted ? .repost : .unrepost) { credential in
             try await adapter.setReposted(reposted, postID: postID, credential: credential)
         }
+    }
+
+    /// Run a read-only authorization check with the same account lock used by writes.
+    public func verifyCredential(
+        _ id: SocialAccount.ID,
+        with check: @Sendable (Adapter, SocialCredential) async throws -> Void
+    ) async throws {
+        try Task.checkCancellation()
+        try begin(id)
+        defer { busyAccounts.remove(id) }
+        guard let credential = try await store.credential(for: id), credential.account.id == id else {
+            throw SocialError.authenticationRequired
+        }
+        if let expiry = credential.expiresAt, expiry <= .now { throw SocialError.authenticationRequired }
+        try Task.checkCancellation()
+        try await check(adapter, credential)
     }
 
     private func begin(_ id: SocialAccount.ID) throws {

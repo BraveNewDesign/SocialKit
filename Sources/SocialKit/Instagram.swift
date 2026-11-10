@@ -27,7 +27,7 @@ public struct InstagramAuthorization: Sendable {
 /// Endpoints and scopes checked 2026-11-08 against Meta's Instagram Login docs:
 /// https://developers.facebook.com/docs/instagram-platform/content-publishing
 /// https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/comment-moderation
-public struct InstagramAdapter: SocialAdapter {
+public struct InstagramAdapter: MetaCheckpointPublishing {
     public typealias Authorization = InstagramAuthorization
     public let platform: SocialPlatform = .instagram
     public let capabilities: Set<SocialCapability> = [
@@ -60,20 +60,27 @@ public struct InstagramAdapter: SocialAdapter {
             ("response_type", "code"),
             ("state", transaction.state)
         ])
+        if let session = authorization.exchange as? any SessionBoundMetaOAuthExchange {
+            try await session.prepare(platform: .instagram, clientID: authorization.clientID,
+                                      redirectURI: authorization.redirectURI, state: transaction.state)
+        }
+        try Task.checkCancellation()
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
         let code = try transaction.code(from: normalizeMetaOAuthCallback(callback, platform: .instagram))
         let token = try await authorization.exchange.exchange(platform: .instagram, code: code, redirectURI: authorization.redirectURI)
         let account = try await fetchProfile(accessToken: token.accessToken)
-        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
-                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+        return SocialCredential(account: account, accessToken: token.accessToken,
+                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
+                                metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
     }
 
     /// Builds an Instagram credential from an access token supplied by a development token flow.
     public func developmentCredential(_ token: OAuthToken) async throws -> SocialCredential {
         try validateMetaDevelopmentToken(token)
         let account = try await fetchProfile(accessToken: token.accessToken)
-        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
-                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+        return SocialCredential(account: account, accessToken: token.accessToken,
+                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
+                                metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
     }
 
     /// Fetches the authenticated Instagram professional account associated with this credential.
@@ -93,16 +100,18 @@ public struct InstagramAdapter: SocialAdapter {
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
         try validate(credential)
-        if let expiry = credential.expiresAt, expiry <= Date() { throw SocialError.authenticationRequired }
+        let now = Date()
+        if let expiry = credential.expiresAt, expiry <= now { throw SocialError.authenticationRequired }
+        guard credential.canRefreshMetaLongLivedToken(at: now) else { throw SocialError.unsupported(.refreshSession) }
         let api = try MetaHTTP(transport: transport, origin: accountServer, accessToken: credential.accessToken)
         let value: InstagramRefreshResponse = try await api.get("/refresh_access_token", query: [
             ("grant_type", "ig_refresh_token"), ("access_token", credential.accessToken)
         ])
         guard !value.access_token.isEmpty, value.expires_in > 0 else { throw SocialError.invalidResponse }
         return SocialCredential(account: credential.account, accessToken: value.access_token,
-                                refreshToken: credential.refreshToken,
-                                expiresAt: Date().addingTimeInterval(TimeInterval(value.expires_in)),
-                                grantedScopes: credential.grantedScopes)
+                                expiresAt: now.addingTimeInterval(TimeInterval(value.expires_in)),
+                                grantedScopes: credential.grantedScopes,
+                                metaLongLivedRefreshEligibleAt: now.addingTimeInterval(24 * 60 * 60))
     }
 
     public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
@@ -121,6 +130,13 @@ public struct InstagramAdapter: SocialAdapter {
     }
 
     public func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try await publishSingle(media, draft: draft, credential: credential, checkpoint: nil, save: nil)
+    }
+
+    private func publishSingle(
+        _ media: SocialMedia, draft: TextPost, credential: SocialCredential,
+        checkpoint: MetaPublishingCheckpoint?, save: MetaPublishingCheckpointWriter?
+    ) async throws -> SocialPost {
         try validate(credential)
         let accountID = try metaPathID(credential.account.remoteID)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
@@ -137,9 +153,13 @@ public struct InstagramAdapter: SocialAdapter {
         case .imageData:
             throw SocialError.invalidInput // Instagram's container API fetches public media URLs.
         }
-        let container: MetaID = try await api.post("/\(accountID)/media", form: form)
-        guard try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
-        let result: MetaID = try await api.post("/\(accountID)/media_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        let containerID = try await metaPublishingContainer(checkpoint: checkpoint, draft: draft, save: save) {
+            let container: MetaID = try await api.post("/\(accountID)/media", form: form)
+            return container.id
+        }
+        guard try await waitForContainer(containerID, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
+        try await beginMetaPublish(containerID, save: save)
+        let result: MetaID = try await api.post("/\(accountID)/media_publish", form: [("creation_id", containerID)], key: draft.idempotencyKey)
         let attachment: SocialAttachment
         switch media {
         case .imageURL(let url): attachment = SocialAttachment(kind: .image, url: url)
@@ -153,8 +173,22 @@ public struct InstagramAdapter: SocialAdapter {
     /// Publishes an Instagram carousel containing two to ten ordered images and/or videos.
     /// Instagram fetches each source URL directly; this adapter does not download media.
     public func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try await publishAlbumOrSingle(media, draft: draft, credential: credential, checkpoint: nil, save: nil)
+    }
+
+    func publishCheckpointed(
+        _ media: [SocialMedia], draft: TextPost, credential: SocialCredential,
+        checkpoint: MetaPublishingCheckpoint?, save: @escaping MetaPublishingCheckpointWriter
+    ) async throws -> SocialPost {
+        try await publishAlbumOrSingle(media, draft: draft, credential: credential, checkpoint: checkpoint, save: save)
+    }
+
+    private func publishAlbumOrSingle(
+        _ media: [SocialMedia], draft: TextPost, credential: SocialCredential,
+        checkpoint: MetaPublishingCheckpoint?, save: MetaPublishingCheckpointWriter?
+    ) async throws -> SocialPost {
         if media.count == 1, let first = media.first {
-            return try await publishMedia(first, draft: draft, credential: credential)
+            return try await publishSingle(first, draft: draft, credential: credential, checkpoint: checkpoint, save: save)
         }
         guard (2...10).contains(media.count) else { throw SocialError.invalidInput }
         try validate(credential)
@@ -173,33 +207,46 @@ public struct InstagramAdapter: SocialAdapter {
 
         let accountID = try metaPathID(credential.account.remoteID)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
-        var children: [String] = []
-        for (url, mediaType) in items {
-            let sourceField = mediaType == "IMAGE" ? "image_url" : "video_url"
-            let child: MetaID = try await api.post("/\(accountID)/media", form: [
-                (sourceField, url.absoluteString),
-                ("media_type", mediaType),
-                ("is_carousel_item", "true")
-            ])
-            guard let id = try? metaPathID(child.id) else { throw SocialError.invalidResponse }
-            children.append(id)
-        }
-        for child in children {
-            guard try await waitForContainer(child, api: api) else { throw SocialError.mediaProcessingTimedOut }
-        }
+        let containerID = try await metaPublishingContainer(checkpoint: checkpoint, draft: draft, save: save) {
+            var children: [String] = []
+            for (url, mediaType) in items {
+                let sourceField = mediaType == "IMAGE" ? "image_url" : "video_url"
+                let child: MetaID = try await api.post("/\(accountID)/media", form: [
+                    (sourceField, url.absoluteString),
+                    ("media_type", mediaType),
+                    ("is_carousel_item", "true")
+                ])
+                guard let id = try? metaPathID(child.id) else { throw SocialError.invalidResponse }
+                children.append(id)
+            }
+            for child in children {
+                guard try await waitForContainer(child, api: api) else { throw SocialError.mediaProcessingTimedOut }
+            }
 
-        var form = [("media_type", "CAROUSEL"), ("children", children.joined(separator: ","))]
-        if !draft.text.isEmpty { form.append(("caption", draft.text)) }
-        let container: MetaID = try await api.post("/\(accountID)/media", form: form)
-        guard try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
+            var form = [("media_type", "CAROUSEL"), ("children", children.joined(separator: ","))]
+            if !draft.text.isEmpty { form.append(("caption", draft.text)) }
+            let container: MetaID = try await api.post("/\(accountID)/media", form: form)
+            return container.id
+        }
+        guard try await waitForContainer(containerID, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
+        try await beginMetaPublish(containerID, save: save)
         // Publishing is a single, non-retried operation. HTTPClient reports an unknown outcome
         // with the draft key if the request may have reached Meta but no response was confirmed.
-        let result: MetaID = try await api.post("/\(accountID)/media_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        let result: MetaID = try await api.post("/\(accountID)/media_publish", form: [("creation_id", containerID)], key: draft.idempotencyKey)
         let attachments = items.map { url, type in
             SocialAttachment(kind: type == "IMAGE" ? .image : .video, url: url)
         }
         guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text, media: attachments)
+    }
+
+    func wasPublished(_ checkpoint: MetaPublishingCheckpoint, credential: SocialCredential) async throws -> Bool {
+        try validate(credential)
+        let id = try metaPathID(checkpoint.containerID)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let status: InstagramContainerStatus = try await api.get("/\(id)", query: [("fields", "id,status_code")])
+        guard status.id == id else { throw SocialError.invalidResponse }
+        return status.status_code == "PUBLISHED"
     }
 
     private func waitForContainer(_ id: String, api: MetaHTTP, publishingKey: UUID? = nil) async throws -> Bool {

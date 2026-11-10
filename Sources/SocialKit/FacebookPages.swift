@@ -35,7 +35,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
     public typealias Authorization = FacebookPagesAuthorization
     public let platform: SocialPlatform = .facebookPages
     public let capabilities: Set<SocialCapability> = [
-        .publishText, .readPost, .listPosts, .like, .unlike, .reply, .readReplies, .deleteReply
+        .refreshSession, .publishText, .publishMedia, .readPost, .listPosts, .like, .unlike, .reply, .readReplies, .deleteReply
     ]
 
     private let transport: any HTTPTransport
@@ -54,6 +54,11 @@ public struct FacebookPagesAdapter: SocialAdapter {
             ("response_type", "code"),
             ("state", transaction.state)
         ])
+        if let session = authorization.exchange as? any SessionBoundMetaOAuthExchange {
+            try await session.prepare(platform: .facebookPages, clientID: authorization.clientID,
+                                      redirectURI: authorization.redirectURI, state: transaction.state)
+        }
+        try Task.checkCancellation()
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
         let code = try transaction.code(from: normalizeMetaOAuthCallback(callback, platform: .facebookPages))
         let userToken = try await authorization.exchange.exchange(platform: .facebookPages, code: code, redirectURI: authorization.redirectURI)
@@ -99,7 +104,9 @@ public struct FacebookPagesAdapter: SocialAdapter {
                                     displayName: selected.name.isEmpty ? selected.id : selected.name,
                                     profileURL: URL(string: "https://www.facebook.com/\(selected.id)"))
         return SocialCredential(account: account, accessToken: selected.access_token,
-                                grantedScopes: grantedScopes)
+                                grantedScopes: grantedScopes,
+                                facebookPageSourceGrant: OAuthToken(accessToken: userToken.accessToken,
+                                                                    expiresAt: userToken.expiresAt))
     }
 
     /// Lists Pages available to a user access token, for an explicit development picker.
@@ -124,14 +131,28 @@ public struct FacebookPagesAdapter: SocialAdapter {
         let scopes = try await verifiedPermissions(api: api)
         let choices = try await pageChoices(api: api)
         guard let page = choices.first(where: { $0.id == pageID }) else { throw SocialError.invalidInput }
+        guard page.canPublish, scopes.contains("pages_manage_posts") else { throw SocialError.permissionDenied }
         guard !page.access_token.isEmpty else { throw SocialError.invalidResponse }
         let account = SocialAccount(platform: .facebookPages, server: accountServer, remoteID: page.id,
                                     username: page.name.isEmpty ? page.id : page.name,
                                     displayName: page.name.isEmpty ? page.id : page.name,
                                     profileURL: URL(string: "https://www.facebook.com/\(page.id)"))
-        let credential = SocialCredential(account: account, accessToken: page.access_token, grantedScopes: scopes)
+        let credential = SocialCredential(account: account, accessToken: page.access_token, grantedScopes: scopes,
+                                          facebookPageSourceGrant: OAuthToken(accessToken: token.accessToken,
+                                                                              expiresAt: token.expiresAt))
         _ = try await profile(credential: credential) // Confirm that the Page token resolves the selected Page.
         return credential
+    }
+
+    /// Recover a Page token from its original user grant and confirm the same Page identity.
+    public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
+        try validate(credential)
+        guard let source = credential.facebookPageSourceGrant else { throw SocialError.authenticationRequired }
+        do {
+            return try await developmentCredential(source, pageID: credential.account.remoteID)
+        } catch SocialError.invalidInput {
+            throw SocialError.permissionDenied
+        }
     }
 
     /// Fetches the Page name associated with a Page credential.
@@ -186,9 +207,11 @@ public struct FacebookPagesAdapter: SocialAdapter {
     }
 
     public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
-        guard let scopes = credential.grantedScopes else { return capabilities }
         var result = capabilities
+        if credential.facebookPageSourceGrant == nil { result.remove(.refreshSession) }
+        guard let scopes = credential.grantedScopes else { return result.subtracting([.publishMedia]) }
         if !scopes.contains("pages_manage_posts") { result.remove(.publishText) }
+        if !Self.photoPermissions.isSubset(of: scopes) { result.remove(.publishMedia) }
         if !scopes.contains("pages_manage_engagement") { result.remove(.like); result.remove(.unlike) }
         if !scopes.contains("pages_manage_engagement") { result.remove(.reply); result.remove(.deleteReply) }
         if !scopes.contains("pages_read_user_content") || !scopes.contains("pages_read_engagement") { result.remove(.readReplies) }
@@ -204,6 +227,28 @@ public struct FacebookPagesAdapter: SocialAdapter {
                                                 form: [("message", draft.text)], key: draft.idempotencyKey)
         guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text)
+    }
+
+    /// Publishes one hosted photo to a Page. The returned ID refers to the feed post.
+    public func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+        try validate(credential)
+        guard capabilities(for: credential).contains(.publishMedia) else { throw SocialError.permissionDenied }
+        guard case let .imageURL(url) = media else { throw SocialError.unsupported(.publishMedia) }
+        guard url.scheme?.lowercased() == "https", url.host?.isEmpty == false,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else {
+            throw SocialError.invalidInput
+        }
+        var form = [("url", url.absoluteString), ("published", "true")]
+        if !draft.text.isEmpty { form.append(("caption", draft.text)) }
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let result: FacebookPhotoPublishResult = try await api.post(
+            "/\(try metaPathID(credential.account.remoteID))/photos", form: form, key: draft.idempotencyKey
+        )
+        guard let postID = result.post_id, (try? metaPathID(postID)) != nil else {
+            // A photo ID alone cannot confirm a feed post. Never repeat an ambiguous write.
+            throw SocialError.publishOutcomeUnknown(draft.idempotencyKey)
+        }
+        return SocialPost(id: postID, text: draft.text, media: [SocialAttachment(kind: .image, url: url)])
     }
 
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
@@ -267,6 +312,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
               !credential.accessToken.isEmpty else { throw SocialError.invalidConfiguration }
     }
 
+    private static let photoPermissions: Set<String> = ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]
     private static let postFields = "id,message,from{id,name},permalink_url,created_time,likes.limit(0).summary(true),attachments{media_type,media,subattachments}"
 }
 
@@ -292,4 +338,8 @@ private struct FacebookPermission: Decodable, Sendable {
 private struct FacebookPageProfile: Decodable, Sendable {
     let id: String
     let name: String
+}
+
+private struct FacebookPhotoPublishResult: Decodable, Sendable {
+    let post_id: String?
 }

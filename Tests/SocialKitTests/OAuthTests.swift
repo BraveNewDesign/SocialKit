@@ -6,13 +6,14 @@ import Testing
 @Test func oauthBindsCallbackAndUsesS256() throws {
     let redirect = try #require(URL(string: "com.example.app:/oauth"))
     let transaction = try OAuthTransaction(redirectURI: redirect)
-    let expected = Data(SHA256.hash(data: Data(transaction.verifier.utf8))).base64EncodedString()
+    let pkce = OAuthPKCE()
+    let expected = Data(SHA256.hash(data: Data(pkce.verifier.utf8))).base64EncodedString()
         .replacingOccurrences(of: "+", with: "-")
         .replacingOccurrences(of: "/", with: "_")
         .replacingOccurrences(of: "=", with: "")
-    #expect(transaction.challenge == expected)
-    #expect(transaction.verifier.count == 43)
-    #expect(transaction.state != transaction.verifier)
+    #expect(pkce.challenge == expected)
+    #expect(pkce.verifier.count == 43)
+    #expect(transaction.state != pkce.verifier)
 
     let callback = try OAuthForm.queryURL(redirect, parameters: [("state", transaction.state), ("code", "a+b /")])
     #expect(try transaction.code(from: callback) == "a+b /")

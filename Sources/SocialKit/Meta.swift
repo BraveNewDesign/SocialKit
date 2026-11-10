@@ -59,7 +59,7 @@ struct MetaHTTP: Sendable {
             publishingKey: publishingKey,
             classifyError: { response in
                 let graphError = try? JSONDecoder().decode(MetaGraphError.self, from: response.body).error
-                if graphError?.code == 190 { return .authenticationRequired }
+                if [102, 190].contains(graphError?.code ?? -1) { return .authenticationRequired }
                 if response.statusCode == 429 || [4, 17, 32, 613].contains(graphError?.code ?? -1) {
                     return .rateLimited(retryAfter: response.header("Retry-After"))
                 }

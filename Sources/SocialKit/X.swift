@@ -42,13 +42,14 @@ public struct XAdapter: SocialAdapter {
             throw SocialError.invalidConfiguration
         }
         let transaction = try OAuthTransaction(redirectURI: authorization.redirectURI)
+        let pkce = OAuthPKCE()
         let authURL = try OAuthForm.queryURL(URL(string: "https://x.com/i/oauth2/authorize")!, parameters: [
             ("response_type", "code"),
             ("client_id", clientID),
             ("redirect_uri", authorization.redirectURI.absoluteString),
             ("scope", Self.scopes(includeMediaWrite: includeMediaWriteScope).joined(separator: " ")),
             ("state", transaction.state),
-            ("code_challenge", transaction.challenge),
+            ("code_challenge", pkce.challenge),
             ("code_challenge_method", "S256")
         ])
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
@@ -60,7 +61,7 @@ public struct XAdapter: SocialAdapter {
                 ("grant_type", "authorization_code"),
                 ("code", code),
                 ("redirect_uri", authorization.redirectURI.absoluteString),
-                ("code_verifier", transaction.verifier),
+                ("code_verifier", pkce.verifier),
                 ("client_id", clientID)
             ]
         )

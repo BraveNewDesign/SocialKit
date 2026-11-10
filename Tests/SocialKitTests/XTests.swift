@@ -44,7 +44,7 @@ struct XTests {
         #expect(tokenForm["client_id"] == "public-client-id")
         #expect(tokenForm["code"] == "mock-code")
         #expect(tokenForm["code_verifier"].map(Self.challenge) == challenge)
-        #expect(transport.requests[1].url?.absoluteString == "https://api.x.com/2/users/me?user.fields=username")
+        #expect(transport.requests[1].url?.absoluteString == "https://api.x.com/2/users/me?user.fields=username,name")
         #expect(transport.requests[1].value(forHTTPHeaderField: "Authorization") == "Bearer access")
     }
 

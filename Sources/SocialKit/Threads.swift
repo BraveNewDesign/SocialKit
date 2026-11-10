@@ -29,7 +29,7 @@ public struct ThreadsAuthorization: Sendable {
 /// https://developers.facebook.com/documentation/threads/posts/reposts
 /// Long-lived token refresh requires an unexpired token; Meta's documented endpoint takes the
 /// token as a query parameter: https://developers.facebook.com/docs/threads/long-lived-tokens/
-public struct ThreadsAdapter: SocialAdapter {
+public struct ThreadsAdapter: MetaCheckpointPublishing {
     public typealias Authorization = ThreadsAuthorization
     public let platform: SocialPlatform = .threads
     public let capabilities: Set<SocialCapability> = [
@@ -63,20 +63,27 @@ public struct ThreadsAdapter: SocialAdapter {
             ("response_type", "code"),
             ("state", transaction.state)
         ])
+        if let session = authorization.exchange as? any SessionBoundMetaOAuthExchange {
+            try await session.prepare(platform: .threads, clientID: authorization.clientID,
+                                      redirectURI: authorization.redirectURI, state: transaction.state)
+        }
+        try Task.checkCancellation()
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
         let code = try transaction.code(from: callback)
         let token = try await authorization.exchange.exchange(platform: .threads, code: code, redirectURI: authorization.redirectURI)
         let account = try await fetchProfile(accessToken: token.accessToken)
-        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
-                               expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+        return SocialCredential(account: account, accessToken: token.accessToken,
+                               expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
+                                metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
     }
 
     /// Builds a Threads credential from an access token supplied by a development token flow.
     public func developmentCredential(_ token: OAuthToken) async throws -> SocialCredential {
         try validateMetaDevelopmentToken(token)
         let account = try await fetchProfile(accessToken: token.accessToken)
-        return SocialCredential(account: account, accessToken: token.accessToken, refreshToken: token.refreshToken,
-                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes)
+        return SocialCredential(account: account, accessToken: token.accessToken,
+                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
+                                metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
     }
 
     /// Fetches the authenticated Threads profile associated with this credential.
@@ -96,16 +103,18 @@ public struct ThreadsAdapter: SocialAdapter {
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
         try validate(credential)
-        if let expiry = credential.expiresAt, expiry <= Date() { throw SocialError.authenticationRequired }
+        let now = Date()
+        if let expiry = credential.expiresAt, expiry <= now { throw SocialError.authenticationRequired }
+        guard credential.canRefreshMetaLongLivedToken(at: now) else { throw SocialError.unsupported(.refreshSession) }
         let api = try MetaHTTP(transport: transport, origin: accountServer, accessToken: credential.accessToken)
         let value: MetaRefreshResponse = try await api.get("/refresh_access_token", query: [
             ("grant_type", "th_refresh_token"), ("access_token", credential.accessToken)
         ])
         guard !value.access_token.isEmpty, value.expires_in > 0 else { throw SocialError.invalidResponse }
         return SocialCredential(account: credential.account, accessToken: value.access_token,
-                                refreshToken: credential.refreshToken,
-                                expiresAt: Date().addingTimeInterval(TimeInterval(value.expires_in)),
-                                grantedScopes: credential.grantedScopes)
+                                expiresAt: now.addingTimeInterval(TimeInterval(value.expires_in)),
+                                grantedScopes: credential.grantedScopes,
+                                metaLongLivedRefreshEligibleAt: now.addingTimeInterval(24 * 60 * 60))
     }
 
     public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
@@ -127,7 +136,18 @@ public struct ThreadsAdapter: SocialAdapter {
         try await publishContainer(media: media, draft: draft, credential: credential)
     }
 
-    private func publishContainer(media: SocialMedia?, draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
+    func publishCheckpointed(
+        _ media: [SocialMedia], draft: TextPost, credential: SocialCredential,
+        checkpoint: MetaPublishingCheckpoint?, save: @escaping MetaPublishingCheckpointWriter
+    ) async throws -> SocialPost {
+        guard media.count <= 1 else { throw SocialError.unsupported(.publishMultipleMedia) }
+        return try await publishContainer(media: media.first, draft: draft, credential: credential, checkpoint: checkpoint, save: save)
+    }
+
+    private func publishContainer(
+        media: SocialMedia?, draft: TextPost, credential: SocialCredential,
+        checkpoint: MetaPublishingCheckpoint? = nil, save: MetaPublishingCheckpointWriter? = nil
+    ) async throws -> SocialPost {
         try validate(credential)
         try Self.validateText(draft.text, allowsEmpty: media != nil)
         let id = try metaPathID(credential.account.remoteID)
@@ -141,12 +161,24 @@ public struct ThreadsAdapter: SocialAdapter {
             try requireHTTPS(url); form = [("media_type", "VIDEO"), ("video_url", url.absoluteString), ("text", draft.text)]
         case .imageData: throw SocialError.invalidInput // Threads fetches public URLs; binary upload is not available in this contract.
         }
-        let container: MetaID = try await api.post("/\(id)/threads", form: form)
-        let ready = try await waitForContainer(container.id, api: api, publishingKey: draft.idempotencyKey)
-        guard ready else { throw SocialError.mediaProcessingTimedOut }
-        let result: MetaID = try await api.post("/\(id)/threads_publish", form: [("creation_id", container.id)], key: draft.idempotencyKey)
+        let containerID = try await metaPublishingContainer(checkpoint: checkpoint, draft: draft, save: save) {
+            let container: MetaID = try await api.post("/\(id)/threads", form: form)
+            return container.id
+        }
+        guard try await waitForContainer(containerID, api: api, publishingKey: draft.idempotencyKey) else { throw SocialError.mediaProcessingTimedOut }
+        try await beginMetaPublish(containerID, save: save)
+        let result: MetaID = try await api.post("/\(id)/threads_publish", form: [("creation_id", containerID)], key: draft.idempotencyKey)
         guard (try? metaPathID(result.id)) != nil else { throw SocialError.publishOutcomeUnknown(draft.idempotencyKey) }
         return SocialPost(id: result.id, text: draft.text, media: socialAttachments(for: media))
+    }
+
+    func wasPublished(_ checkpoint: MetaPublishingCheckpoint, credential: SocialCredential) async throws -> Bool {
+        try validate(credential)
+        let id = try metaPathID(checkpoint.containerID)
+        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let status: ThreadsContainerStatus = try await api.get("/\(id)", query: [("fields", "id,status")])
+        guard status.id == id else { throw SocialError.invalidResponse }
+        return status.status == "PUBLISHED"
     }
 
     private func waitForContainer(_ id: String, api: MetaHTTP, publishingKey: UUID) async throws -> Bool {

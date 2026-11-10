@@ -8,23 +8,40 @@ public struct SocialCredential: Codable, Sendable, CustomStringConvertible, Cust
     public let refreshToken: String?
     public let expiresAt: Date?
     public let grantedScopes: Set<String>?
+    /// Present only for confirmed long-lived Instagram and Threads credentials.
+    public let metaLongLivedRefreshEligibleAt: Date?
+    /// User grant used to recover this Page token. Its expiry is independent of the Page token.
+    public let facebookPageSourceGrant: OAuthToken?
 
     public init(
         account: SocialAccount,
         accessToken: String,
         refreshToken: String? = nil,
         expiresAt: Date? = nil,
-        grantedScopes: Set<String>? = nil
+        grantedScopes: Set<String>? = nil,
+        metaLongLivedRefreshEligibleAt: Date? = nil,
+        facebookPageSourceGrant: OAuthToken? = nil
     ) {
         self.account = account
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
         self.grantedScopes = grantedScopes
+        self.metaLongLivedRefreshEligibleAt = metaLongLivedRefreshEligibleAt
+        self.facebookPageSourceGrant = facebookPageSourceGrant
     }
 
     public var oauthToken: OAuthToken {
-        OAuthToken(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, grantedScopes: grantedScopes)
+        OAuthToken(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt,
+                   grantedScopes: grantedScopes, metaLongLivedRefreshEligibleAt: metaLongLivedRefreshEligibleAt)
+    }
+
+    /// Meta refresh requires a confirmed long-lived token, past its waiting period and still valid.
+    /// An unknown expiry stays unknown and must be verified by the provider.
+    public func canRefreshMetaLongLivedToken(at date: Date = Date()) -> Bool {
+        guard account.platform == .instagram || account.platform == .threads,
+              let eligibleAt = metaLongLivedRefreshEligibleAt, eligibleAt <= date else { return false }
+        return expiresAt.map { $0 > date } ?? true
     }
 
     public var description: String { "SocialCredential(\(account.platform.rawValue), redacted)" }

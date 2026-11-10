@@ -64,6 +64,34 @@ struct MetaTests {
         #expect(await transport.requests.isEmpty)
     }
 
+    @Test("Meta registers the exact OAuth state before the browser and rejects a different callback path")
+    @MainActor
+    func threadsBindsBrokerSessionToBrowser() async throws {
+        let transport = MetaStubTransport([])
+        let exchange = SessionBoundMockExchange()
+        let redirect = try #require(URL(string: "https://callback.example/threads"))
+        let otherRedirect = try #require(URL(string: "https://callback.example/threads/"))
+        let adapter = ThreadsAdapter(transport: transport)
+
+        await #expect(throws: SocialError.authorizationFailed) {
+            try await adapter.connect(ThreadsAuthorization(
+                clientID: "app", redirectURI: redirect,
+                browser: { url, callbackURL in
+                    #expect(callbackURL == redirect)
+                    let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+                    let state = try #require(query.first { $0.name == "state" }?.value)
+                    #expect(!query.contains { $0.name == "code_challenge" || $0.name == "code_challenge_method" })
+                    #expect(await exchange.prepared == [
+                        "platform": "threads", "client_id": "app", "redirect_uri": redirect.absoluteString, "state": state
+                    ])
+                    return try callback(url: url, callbackURL: otherRedirect)
+                }, exchange: exchange
+            ))
+        }
+        #expect(await exchange.exchangeCount == 0)
+        #expect(await transport.requests.isEmpty)
+    }
+
     @Test("Threads paginates posts with the opaque after cursor")
     func threadsPagination() async throws {
         let transport = MetaStubTransport([
@@ -114,6 +142,66 @@ struct MetaTests {
         #expect(requests[1].value(forHTTPHeaderField: "Authorization") == "Bearer user-token")
         #expect(requests.dropFirst(2).allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer page-token" })
         #expect(credential.grantedScopes == ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "pages_manage_engagement", "pages_read_user_content"])
+    }
+
+    @Test("Facebook hosted photo publishing uses verified Page grants and returns the feed post ID")
+    func facebookHostedPhoto() async throws {
+        let transport = MetaStubTransport([json(#"{"id":"1234","post_id":"page42_9"}"#)])
+        let adapter = FacebookPagesAdapter(transport: transport)
+        let credential = pagePhotoCredential()
+        let store = MemoryCredentialStore()
+        await store.save(credential)
+        let client = SocialClient(adapter: adapter, store: store)
+        let url = URL(string: "https://media.example/sunset.jpg")!
+        let draft = TextPost(text: "Sunset & sky")
+        let post = try await client.publishMedia([.imageURL(url)], draft: draft, as: credential.account.id)
+        #expect(post.id == "page42_9")
+        #expect(post.text == draft.text)
+        #expect(post.media == [SocialAttachment(kind: .image, url: url)])
+        let request = try #require(await transport.requests.first)
+        #expect(request.url?.absoluteString == "https://graph.facebook.com/v27.0/page42/photos")
+        #expect(request.httpMethod == "POST")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer page-token")
+        #expect(form(request) == ["url": url.absoluteString, "caption": draft.text, "published": "true"])
+    }
+
+    @Test("Facebook hosted photos reject unsupported payloads and unknown or insufficient grants before sending")
+    func facebookHostedPhotoValidation() async throws {
+        let transport = MetaStubTransport([])
+        let adapter = FacebookPagesAdapter(transport: transport)
+        let credential = pagePhotoCredential()
+        let draft = TextPost(text: "")
+        let url = URL(string: "https://media.example/sunset.jpg")!
+        await #expect(throws: SocialError.permissionDenied) {
+            try await adapter.publishMedia(.imageURL(url), draft: draft, credential: pageCredential())
+        }
+        await #expect(throws: SocialError.permissionDenied) {
+            try await adapter.publishMedia(
+                .imageURL(url), draft: draft, credential: pagePhotoCredential(scopes: ["pages_manage_posts"])
+            )
+        }
+        await #expect(throws: SocialError.unsupported(.publishMedia)) {
+            try await adapter.publishMedia(.videoURL(url), draft: draft, credential: credential)
+        }
+        await #expect(throws: SocialError.invalidInput) {
+            let privateURL = URL(string: "https://media.example/sunset.jpg?token=private")!
+            try await adapter.publishMedia(.imageURL(privateURL), draft: draft, credential: credential)
+        }
+        #expect(await transport.requests.isEmpty)
+    }
+
+    @Test("A Facebook photo ID without a feed post ID leaves publication uncertain")
+    func facebookPhotoOnlyReceipt() async throws {
+        let transport = MetaStubTransport([json(#"{"id":"1234"}"#)])
+        let adapter = FacebookPagesAdapter(transport: transport)
+        let draft = TextPost(text: "")
+        let url = URL(string: "https://media.example/sunset.jpg")!
+        await #expect(throws: SocialError.publishOutcomeUnknown(draft.idempotencyKey)) {
+            try await adapter.publishMedia(.imageURL(url), draft: draft, credential: pagePhotoCredential())
+        }
+        let request = try #require(await transport.requests.first)
+        #expect(form(request) == ["url": url.absoluteString, "published": "true"])
+        #expect(await transport.requests.count == 1)
     }
 
     @Test("Facebook Page comment writes, comment pages and deletion use the Page token")
@@ -177,18 +265,22 @@ struct MetaTests {
             json(#"{"data":[{"permission":"pages_show_list","status":"granted"},{"permission":"pages_manage_posts","status":"granted"},{"permission":"pages_manage_engagement","status":"declined"}]}"#),
             json(#"{"data":[{"id":"page42","name":"Brand Page","tasks":["ANALYZE"]}],"paging":{}}"#),
             json(#"{"data":[{"permission":"pages_show_list","status":"granted"},{"permission":"pages_manage_posts","status":"granted"},{"permission":"pages_manage_engagement","status":"declined"}]}"#),
-            json(#"{"data":[{"id":"page42","name":"Brand Page","access_token":"page-token","tasks":["ANALYZE"]}],"paging":{}}"#),
+            json(#"{"data":[{"id":"page42","name":"Brand Page","access_token":"page-token","tasks":["CREATE_CONTENT"]}],"paging":{}}"#),
             json(#"{"id":"page42","name":"Brand Page"}"#),
             json(#"{"id":"page42","name":"Updated Page Name"}"#)
         ])
         let facebook = FacebookPagesAdapter(transport: facebookTransport)
-        let token = OAuthToken(accessToken: "dev-user-token")
+        let expiry = Date.now.addingTimeInterval(24 * 60 * 60)
+        let token = OAuthToken(accessToken: "dev-user-token", expiresAt: expiry)
         let pages = try await facebook.discoverPages(token)
         #expect(pages.map(\.remoteID) == ["page42"])
         let pageCredential = try await facebook.developmentCredential(token, pageID: "page42")
         #expect(pageCredential.accessToken == "page-token")
         #expect(pageCredential.expiresAt == nil)
         #expect(pageCredential.refreshToken == nil)
+        #expect(pageCredential.facebookPageSourceGrant?.accessToken == "dev-user-token")
+        #expect(pageCredential.facebookPageSourceGrant?.expiresAt == expiry)
+        #expect(pageCredential.facebookPageSourceGrant?.grantedScopes == nil)
         #expect(pageCredential.grantedScopes == ["pages_show_list", "pages_manage_posts"])
         #expect(!facebook.capabilities(for: pageCredential).contains(.like))
         #expect(try await facebook.profile(credential: pageCredential).username == "Updated Page Name")
@@ -332,11 +424,16 @@ struct MetaTests {
     func threadsRefresh() async throws {
         let transport = MetaStubTransport([json(#"{"access_token":"renewed-token","expires_in":5184000}"#)])
         let adapter = ThreadsAdapter(transport: transport)
-        let credential = threadsCredential()
+        let base = threadsCredential()
+        let credential = SocialCredential(account: base.account, accessToken: base.accessToken,
+                                          expiresAt: .distantFuture, grantedScopes: ["threads_basic"],
+                                          metaLongLivedRefreshEligibleAt: .distantPast)
         let refreshed = try await adapter.refresh(credential)
         #expect(refreshed.accessToken == "renewed-token")
         #expect(refreshed.account == credential.account)
         #expect(refreshed.expiresAt != nil)
+        #expect(refreshed.grantedScopes == ["threads_basic"])
+        #expect(!refreshed.canRefreshMetaLongLivedToken())
         #expect(await transport.requests.first?.url?.path == "/refresh_access_token")
     }
 
@@ -344,7 +441,10 @@ struct MetaTests {
     func instagramRefresh() async throws {
         let transport = MetaStubTransport([json(#"{"access_token":"renewed-ig","expires_in":5184000}"#)])
         let adapter = InstagramAdapter(transport: transport)
-        let credential = instagramCredential()
+        let base = instagramCredential()
+        let credential = SocialCredential(account: base.account, accessToken: base.accessToken,
+                                          metaLongLivedRefreshEligibleAt: .distantPast)
+        #expect(credential.expiresAt == nil)
         let refreshed = try await adapter.refresh(credential)
         #expect(refreshed.accessToken == "renewed-ig")
         #expect(refreshed.account == credential.account)
@@ -373,6 +473,21 @@ struct MetaTests {
         await #expect(throws: SocialError.rateLimited(retryAfter: nil)) {
             try await FacebookPagesAdapter(transport: throttled).post(id: "post1", credential: pageCredential())
         }
+    }
+}
+
+private actor SessionBoundMockExchange: SessionBoundMetaOAuthExchange {
+    private(set) var prepared: [String: String] = [:]
+    private(set) var exchangeCount = 0
+
+    func prepare(platform: SocialPlatform, clientID: String, redirectURI: URL, state: String) async throws {
+        prepared = ["platform": platform.rawValue, "client_id": clientID,
+                    "redirect_uri": redirectURI.absoluteString, "state": state]
+    }
+
+    func exchange(platform: SocialPlatform, code: String, redirectURI: URL) async throws -> OAuthToken {
+        exchangeCount += 1
+        return OAuthToken(accessToken: "fixture")
     }
 }
 
@@ -437,6 +552,13 @@ private func threadsCredential() -> SocialCredential {
 
 private func pageCredential() -> SocialCredential {
     SocialCredential(account: SocialAccount(platform: .facebookPages, server: URL(string: "https://graph.facebook.com")!, remoteID: "page42", username: "Page 42"), accessToken: "page-token")
+}
+
+private func pagePhotoCredential(
+    scopes: Set<String> = ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]
+) -> SocialCredential {
+    let existing = pageCredential()
+    return SocialCredential(account: existing.account, accessToken: existing.accessToken, grantedScopes: scopes)
 }
 
 private func instagramCredential() -> SocialCredential {
