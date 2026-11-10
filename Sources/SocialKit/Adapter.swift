@@ -16,6 +16,7 @@ public protocol SocialAdapter: Sendable {
     func reply(_ draft: TextPost, to postID: String, credential: SocialCredential) async throws -> SocialPost
     func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost>
     func deleteReply(id: String, credential: SocialCredential) async throws
+    func resolveMention(_ handle: String, credential: SocialCredential) async throws -> String
     func setReplyHidden(_ hidden: Bool, id: String, credential: SocialCredential) async throws
     func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost
     func publishMedia(_ media: SocialMedia, draft: TextPost, credential: SocialCredential) async throws -> SocialPost
@@ -59,6 +60,10 @@ public extension SocialAdapter {
 
     func deleteReply(id: String, credential: SocialCredential) async throws {
         throw SocialError.unsupported(.deleteReply)
+    }
+
+    func resolveMention(_ handle: String, credential: SocialCredential) async throws -> String {
+        throw SocialError.unsupported(.resolveMentions)
     }
 
     func publishMedia(_ media: [SocialMedia], draft: TextPost, credential: SocialCredential) async throws -> SocialPost {

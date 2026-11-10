@@ -86,7 +86,9 @@ public struct InstagramAdapter: SocialAdapter {
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: accessToken)
         let profile: InstagramProfile = try await api.get("/me", query: [("fields", "id,user_id,username")])
         guard let userID = profile.user_id ?? profile.id, !userID.isEmpty else { throw SocialError.invalidResponse }
-        return SocialAccount(platform: .instagram, server: accountServer, remoteID: userID, username: profile.username)
+        return SocialAccount(platform: .instagram, server: accountServer, remoteID: userID, username: profile.username,
+                             displayName: profile.username,
+                             profileURL: URL(string: "https://www.instagram.com/\(profile.username)/"))
     }
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {

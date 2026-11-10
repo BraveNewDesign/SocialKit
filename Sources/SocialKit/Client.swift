@@ -110,6 +110,12 @@ public actor SocialClient<Adapter: SocialAdapter> {
         }
     }
 
+    public func resolveMention(_ handle: String, as account: SocialAccount.ID) async throws -> String {
+        try await withCredential(account, requiring: .resolveMentions) { credential in
+            try await adapter.resolveMention(handle, credential: credential)
+        }
+    }
+
     public func publishMedia(
         _ media: SocialMedia, draft: TextPost, as id: SocialAccount.ID
     ) async throws -> SocialPost {

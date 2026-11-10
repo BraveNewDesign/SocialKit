@@ -89,7 +89,9 @@ public struct ThreadsAdapter: SocialAdapter {
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: accessToken)
         let profile: ThreadsProfile = try await api.get("/me", query: [("fields", "id,username")])
         guard !profile.id.isEmpty else { throw SocialError.invalidResponse }
-        return SocialAccount(platform: .threads, server: accountServer, remoteID: profile.id, username: profile.username)
+        return SocialAccount(platform: .threads, server: accountServer, remoteID: profile.id, username: profile.username,
+                             displayName: profile.username,
+                             profileURL: URL(string: "https://www.threads.net/@\(profile.username)"))
     }
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {

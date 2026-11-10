@@ -25,7 +25,7 @@ public struct BlueskyAdapter: SocialAdapter {
     }
 
     public let platform: SocialPlatform = .bluesky
-    public let capabilities: Set<SocialCapability> = [.publishText, .readPost, .listPosts, .like, .refreshSession]
+    public let capabilities: Set<SocialCapability> = [.publishText, .readPost, .listPosts, .like, .refreshSession, .resolveMentions]
 
     private let transport: any HTTPTransport
 
@@ -92,11 +92,13 @@ public struct BlueskyAdapter: SocialAdapter {
         }
         let uri = try Self.postID(for: draft.idempotencyKey, createdAt: draft.createdAt, accountDID: credential.account.remoteID)
         let key = try Self.recordKey(for: draft.idempotencyKey, createdAt: draft.createdAt)
-        let record: [String: Any] = [
+        let facets = try Self.mentionFacets(draft.mentions, in: draft.text)
+        var record: [String: Any] = [
             "$type": Self.postCollection,
             "text": draft.text,
             "createdAt": Self.timestamp(draft.createdAt)
         ]
+        if !facets.isEmpty { record["facets"] = facets }
         let response: HTTPResponse
         do {
             response = try await requestJSON(
@@ -128,6 +130,21 @@ public struct BlueskyAdapter: SocialAdapter {
         } catch {
             throw SocialError.publishOutcomeUnknown(draft.idempotencyKey)
         }
+    }
+
+    /// Resolves an account handle to its stable DID for a native mention facet.
+    public func resolveMention(_ handle: String, credential: SocialCredential) async throws -> String {
+        let origin = try Self.origin(for: credential)
+        let normalized = handle.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+        guard !normalized.isEmpty, !normalized.contains(where: \.isWhitespace), normalized.utf8.count <= 253 else {
+            throw SocialError.invalidInput
+        }
+        let url = try OAuthForm.queryURL(origin.endpoint("/xrpc/com.atproto.identity.resolveHandle"),
+                                          parameters: [("handle", normalized)])
+        let response = try await requestJSON(url)
+        let value = try Self.decode(ResolveHandleResponse.self, from: response.body)
+        guard value.did.hasPrefix("did:") else { throw SocialError.invalidResponse }
+        return value.did
     }
 
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
@@ -203,6 +220,23 @@ public struct BlueskyAdapter: SocialAdapter {
     }
 
     private static let postCollection = "app.bsky.feed.post"
+
+    private static func mentionFacets(_ mentions: [SocialMention], in text: String) throws -> [[String: Any]] {
+        let bytes = Array(text.utf8)
+        var previousEnd = 0
+        return try mentions.sorted { $0.byteStart < $1.byteStart }.map { mention in
+            guard mention.byteStart >= previousEnd, mention.byteStart >= 0,
+                  mention.byteEnd > mention.byteStart, mention.byteEnd <= bytes.count,
+                  mention.subjectID.hasPrefix("did:") else { throw SocialError.invalidInput }
+            let segment = String(decoding: bytes[mention.byteStart..<mention.byteEnd], as: UTF8.self)
+            guard segment.first == "@", !segment.dropFirst().contains(where: \.isWhitespace) else {
+                throw SocialError.invalidInput
+            }
+            previousEnd = mention.byteEnd
+            return ["index": ["byteStart": mention.byteStart, "byteEnd": mention.byteEnd],
+                    "features": [["$type": "app.bsky.richtext.facet#mention", "did": mention.subjectID]]]
+        }
+    }
 
     private static func recordKey(for uuid: UUID, createdAt: Date) throws -> String {
         let micros = createdAt.timeIntervalSince1970 * 1_000_000
@@ -283,7 +317,9 @@ public struct BlueskyAdapter: SocialAdapter {
 
     private static func credential(_ session: Session, origin: HTTPSOrigin) -> SocialCredential {
         SocialCredential(
-            account: SocialAccount(platform: .bluesky, server: origin.url, remoteID: session.did, username: session.handle),
+            account: SocialAccount(platform: .bluesky, server: origin.url, remoteID: session.did, username: session.handle,
+                                   displayName: session.handle,
+                                   profileURL: URL(string: "https://bsky.app/profile/\(session.handle)")),
             accessToken: session.accessJwt,
             refreshToken: session.refreshJwt
         )
@@ -346,6 +382,7 @@ public struct BlueskyAdapter: SocialAdapter {
         let did: String
         let handle: String
     }
+    private struct ResolveHandleResponse: Decodable { let did: String }
 
     private struct RecordResponse: Decodable { let uri: String; let cid: String }
     private struct GetRecordResponse: Decodable {

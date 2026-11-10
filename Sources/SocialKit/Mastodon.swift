@@ -112,7 +112,9 @@ public struct MastodonAdapter: SocialAdapter {
                 platform: .mastodon,
                 server: origin.url,
                 remoteID: account.id,
-                username: account.acct
+                username: account.acct,
+                displayName: account.displayName?.isEmpty == false ? account.displayName : account.acct,
+                profileURL: account.url.flatMap(URL.init(string:))
             ),
             accessToken: token.accessToken,
             grantedScopes: token.scope.map { Set($0.split(whereSeparator: \.isWhitespace).map(String.init)) }
@@ -223,7 +225,11 @@ public struct MastodonAdapter: SocialAdapter {
             url: status.url.flatMap(URL.init(string:)),
             createdAt: status.createdAt,
             likeCount: status.favouritesCount,
-            textFormat: .html
+            textFormat: .html,
+            authorID: status.account?.id,
+            authorName: status.account?.displayName,
+            authorHandle: status.account?.acct,
+            parentID: status.inReplyToID
         )
     }
 
@@ -263,7 +269,20 @@ public struct MastodonAdapter: SocialAdapter {
         enum CodingKeys: String, CodingKey { case accessToken = "access_token", tokenType = "token_type", scope }
     }
 
-    private struct Account: Decodable { let id: String; let acct: String }
+    private struct Account: Decodable {
+        let id: String
+        let acct: String
+        let displayName: String?
+        let url: String?
+        enum CodingKeys: String, CodingKey { case id, acct, displayName = "display_name", url }
+    }
+
+    private struct StatusAccount: Decodable {
+        let id: String
+        let acct: String
+        let displayName: String?
+        enum CodingKeys: String, CodingKey { case id, acct, displayName = "display_name" }
+    }
 
     private struct Status: Decodable {
         let id: String
@@ -271,10 +290,13 @@ public struct MastodonAdapter: SocialAdapter {
         let url: String?
         let createdAt: Date?
         let favouritesCount: Int?
+        let inReplyToID: String?
+        let account: StatusAccount?
         enum CodingKeys: String, CodingKey {
-            case id, content, url
+            case id, content, url, account
             case createdAt = "created_at"
             case favouritesCount = "favourites_count"
+            case inReplyToID = "in_reply_to_id"
         }
     }
 }

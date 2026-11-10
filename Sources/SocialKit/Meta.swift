@@ -145,7 +145,7 @@ struct MetaCommentRecord: Decodable, Sendable {
     let timestamp: String?
     let like_count: Int?
 
-    struct From: Decodable, Sendable { let name: String?; let username: String? }
+    struct From: Decodable, Sendable { let id: String?; let name: String?; let username: String? }
     var normalizedText: String { text ?? message ?? "" }
     var normalizedDate: Date? {
         guard let value = timestamp ?? created_time else { return nil }
@@ -162,7 +162,9 @@ func metaDate(_ value: String) -> Date? {
 
 func metaComment(_ value: MetaCommentRecord) -> SocialPost {
     SocialPost(id: value.id, text: value.normalizedText, url: value.permalink_url,
-               createdAt: value.normalizedDate, likeCount: value.like_count)
+               createdAt: value.normalizedDate, likeCount: value.like_count,
+               authorID: value.from?.id, authorName: value.from?.name,
+               authorHandle: value.username ?? value.from?.username)
 }
 
 struct MetaCount: Decodable, Sendable {

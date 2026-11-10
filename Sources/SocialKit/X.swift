@@ -67,7 +67,7 @@ public struct XAdapter: SocialAdapter {
         let token = try Self.decode(Token.self, from: tokenResponse.body)
         guard !token.accessToken.isEmpty, token.expiresIn > 0 else { throw SocialError.invalidResponse }
         let meResponse = try await requestJSON(
-            URL(string: "https://api.x.com/2/users/me?user.fields=username")!,
+            URL(string: "https://api.x.com/2/users/me?user.fields=username,name")!,
             bearer: token.accessToken
         )
         let me = try Self.decode(UserEnvelope.self, from: meResponse.body).data
@@ -77,7 +77,9 @@ public struct XAdapter: SocialAdapter {
                 platform: .x,
                 server: Self.apiOrigin,
                 remoteID: me.id,
-                username: me.username
+                username: me.username,
+                displayName: me.name?.isEmpty == false ? me.name : me.username,
+                profileURL: URL(string: "https://x.com/\(me.username)")
             ),
             accessToken: token.accessToken,
             refreshToken: token.refreshToken,
@@ -196,12 +198,13 @@ public struct XAdapter: SocialAdapter {
 
     private static let maxImageBytes = 5 * 1024 * 1024
     private static let imageTypes: Set<String> = ["image/jpeg", "image/png", "image/webp"]
+    private static let activityTweetFields = "created_at,public_metrics,author_id,conversation_id,referenced_tweets"
 
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
         try Self.validate(credential)
         guard Self.validPostID(id) else { throw SocialError.invalidInput }
         let url = try OAuthForm.queryURL(Self.apiEndpoint("/2/tweets/\(id)"), parameters: [
-            ("tweet.fields", "created_at,public_metrics")
+            ("tweet.fields", Self.activityTweetFields)
         ])
         let response = try await requestJSON(url, bearer: credential.accessToken)
         let result = try Self.decode(PostEnvelope.self, from: response.body)
@@ -211,7 +214,7 @@ public struct XAdapter: SocialAdapter {
 
     public func posts(cursor: String? = nil, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try Self.validate(credential)
-        var parameters = [("max_results", "100"), ("tweet.fields", "created_at,public_metrics")]
+        var parameters = [("max_results", "100"), ("tweet.fields", Self.activityTweetFields)]
         if let cursor { parameters.append(("pagination_token", cursor)) }
         let url = try OAuthForm.queryURL(Self.apiEndpoint("/2/users/\(credential.account.remoteID)/tweets"), parameters: parameters)
         let response = try await requestJSON(url, bearer: credential.accessToken)
@@ -226,7 +229,7 @@ public struct XAdapter: SocialAdapter {
     public func replies(to postID: String, cursor: String? = nil, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try Self.validate(credential)
         guard Self.validPostID(postID) else { throw SocialError.invalidInput }
-        var parameters = [("query", "conversation_id:\(postID) is:reply"), ("max_results", "100"), ("tweet.fields", "created_at,public_metrics")]
+        var parameters = [("query", "conversation_id:\(postID) is:reply"), ("max_results", "100"), ("tweet.fields", Self.activityTweetFields)]
         if let cursor { parameters.append(("next_token", cursor)) }
         let url = try OAuthForm.queryURL(Self.apiEndpoint("/2/tweets/search/recent"), parameters: parameters)
         let response = try await requestJSON(url, bearer: credential.accessToken)
@@ -367,7 +370,10 @@ public struct XAdapter: SocialAdapter {
 
     private static func post(_ value: PostRecord, media: [SocialAttachment] = []) -> SocialPost {
         SocialPost(id: value.id, text: value.text, url: URL(string: "https://x.com/i/web/status/\(value.id)"),
-                   createdAt: value.createdAt, likeCount: value.publicMetrics?.likeCount, media: media)
+                   createdAt: value.createdAt, likeCount: value.publicMetrics?.likeCount, media: media,
+                   authorID: value.authorID,
+                   parentID: value.referencedTweets?.first(where: { $0.type == "replied_to" })?.id,
+                   conversationRootID: value.conversationID)
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
@@ -385,7 +391,7 @@ public struct XAdapter: SocialAdapter {
         }
     }
     private struct UserEnvelope: Decodable { let data: User }
-    private struct User: Decodable { let id: String; let username: String }
+    private struct User: Decodable { let id: String; let username: String; let name: String? }
     private struct ActionEnvelope: Decodable { let data: ActionResult }
     private struct ActionResult: Decodable {
         let liked: Bool?
@@ -406,8 +412,15 @@ public struct XAdapter: SocialAdapter {
         let text: String
         let createdAt: Date?
         let publicMetrics: PublicMetrics?
-        enum CodingKeys: String, CodingKey { case id, text, createdAt = "created_at", publicMetrics = "public_metrics" }
+        let authorID: String?
+        let conversationID: String?
+        let referencedTweets: [TweetReference]?
+        enum CodingKeys: String, CodingKey {
+            case id, text, createdAt = "created_at", publicMetrics = "public_metrics"
+            case authorID = "author_id", conversationID = "conversation_id", referencedTweets = "referenced_tweets"
+        }
     }
+    private struct TweetReference: Decodable { let type: String; let id: String }
     private struct PublicMetrics: Decodable {
         let likeCount: Int?
         enum CodingKeys: String, CodingKey { case likeCount = "like_count" }

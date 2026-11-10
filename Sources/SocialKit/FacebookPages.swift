@@ -95,7 +95,9 @@ public struct FacebookPagesAdapter: SocialAdapter {
         else { throw SocialError.invalidInput } // caller must repeat OAuth with a selected pageID.
         guard !selected.access_token.isEmpty else { throw SocialError.invalidResponse }
         let account = SocialAccount(platform: .facebookPages, server: accountServer, remoteID: selected.id,
-                                    username: selected.name.isEmpty ? selected.id : selected.name)
+                                    username: selected.name.isEmpty ? selected.id : selected.name,
+                                    displayName: selected.name.isEmpty ? selected.id : selected.name,
+                                    profileURL: URL(string: "https://www.facebook.com/\(selected.id)"))
         return SocialCredential(account: account, accessToken: selected.access_token,
                                 grantedScopes: grantedScopes)
     }
@@ -108,7 +110,9 @@ public struct FacebookPagesAdapter: SocialAdapter {
         let choices = try await pageListings(api: api)
         return choices.map { choice in
             SocialAccount(platform: .facebookPages, server: accountServer, remoteID: choice.id,
-                          username: choice.name.isEmpty ? choice.id : choice.name)
+                          username: choice.name.isEmpty ? choice.id : choice.name,
+                          displayName: choice.name.isEmpty ? choice.id : choice.name,
+                          profileURL: URL(string: "https://www.facebook.com/\(choice.id)"))
         }
     }
 
@@ -122,7 +126,9 @@ public struct FacebookPagesAdapter: SocialAdapter {
         guard let page = choices.first(where: { $0.id == pageID }) else { throw SocialError.invalidInput }
         guard !page.access_token.isEmpty else { throw SocialError.invalidResponse }
         let account = SocialAccount(platform: .facebookPages, server: accountServer, remoteID: page.id,
-                                    username: page.name.isEmpty ? page.id : page.name)
+                                    username: page.name.isEmpty ? page.id : page.name,
+                                    displayName: page.name.isEmpty ? page.id : page.name,
+                                    profileURL: URL(string: "https://www.facebook.com/\(page.id)"))
         let credential = SocialCredential(account: account, accessToken: page.access_token, grantedScopes: scopes)
         _ = try await profile(credential: credential) // Confirm that the Page token resolves the selected Page.
         return credential
@@ -135,7 +141,9 @@ public struct FacebookPagesAdapter: SocialAdapter {
         let profile: FacebookPageProfile = try await api.get("/me", query: [("fields", "id,name")])
         guard profile.id == credential.account.remoteID else { throw SocialError.invalidResponse }
         return SocialAccount(platform: .facebookPages, server: accountServer, remoteID: profile.id,
-                             username: profile.name.isEmpty ? profile.id : profile.name)
+                             username: profile.name.isEmpty ? profile.id : profile.name,
+                             displayName: profile.name.isEmpty ? profile.id : profile.name,
+                             profileURL: URL(string: "https://www.facebook.com/\(profile.id)"))
     }
 
     private func verifiedPermissions(api: MetaHTTP) async throws -> Set<String> {

@@ -64,7 +64,9 @@ public struct LinkedInAdapter: SocialAdapter {
         guard credential.account.platform == .linkedIn else { return [] }
         var result = capabilities
         if credential.refreshToken == nil || oauthBroker == nil { result.remove(.refreshSession) }
-        guard let scopes = credential.grantedScopes else { return result }
+        guard let scopes = credential.grantedScopes else {
+            return result.intersection([.refreshSession])
+        }
         let authorIsOrganization = credential.account.remoteID.hasPrefix("urn:li:organization:")
         let writeScope = authorIsOrganization ? "w_organization_social" : "w_member_social"
         let readScope = authorIsOrganization ? "r_organization_social" : "r_member_social"
@@ -116,24 +118,23 @@ public struct LinkedInAdapter: SocialAdapter {
         guard !profile.sub.isEmpty else { throw SocialError.invalidResponse }
         let memberURN = "urn:li:person:\(profile.sub)"
         let author = authorization.organizationURN ?? memberURN
-        let granted = token.grantedScopes ?? authorization.scopes
         let credential = SocialCredential(
             account: SocialAccount(
                 platform: .linkedIn,
                 server: Self.apiOrigin,
                 remoteID: author,
-                username: profile.name?.isEmpty == false ? profile.name! : profile.sub
+                username: authorization.organizationURN ?? (profile.name?.isEmpty == false ? profile.name! : profile.sub),
+                displayName: authorization.organizationURN ?? (profile.name?.isEmpty == false ? profile.name! : profile.sub),
+                authenticatedUserName: profile.name?.isEmpty == false ? profile.name : profile.sub
             ),
             accessToken: token.accessToken,
             refreshToken: token.refreshToken,
             expiresAt: token.expiresAt,
-            grantedScopes: granted
+            grantedScopes: token.grantedScopes
         )
-        // If OAuth returned a scope list, never bind a requested-but-ungranted author.
-        if let scopes = token.grantedScopes {
-            let needed = authorization.organizationURN == nil ? "w_member_social" : "w_organization_social"
-            guard scopes.contains(needed) else { throw SocialError.permissionDenied }
-        }
+        // Require a broker-reported grant; requested scopes alone do not prove access.
+        let needed = authorization.organizationURN == nil ? "w_member_social" : "w_organization_social"
+        guard let scopes = token.grantedScopes, scopes.contains(needed) else { throw SocialError.permissionDenied }
         if let organizationURN = authorization.organizationURN,
            let scopes = credential.grantedScopes,
            scopes.contains("r_organization_admin") || scopes.contains("rw_organization_admin") {
@@ -500,11 +501,13 @@ public struct LinkedInAdapter: SocialAdapter {
     private static func socialPost(_ post: LinkedInPost) -> SocialPost {
         SocialPost(id: post.id, text: post.commentary ?? "", url: postURL(post.id),
                    createdAt: post.publishedAt.map { Date(timeIntervalSince1970: $0 / 1_000) }, likeCount: nil,
-                   media: post.imageIDs.map { _ in SocialAttachment(kind: .image, url: nil) })
+                   media: post.imageIDs.map { _ in SocialAttachment(kind: .image, url: nil) },
+                   authorID: post.author)
     }
     private static func socialPost(_ comment: LinkedInComment) -> SocialPost {
         SocialPost(id: comment.commentUrn, text: comment.message.text,
-                   createdAt: comment.created.map { Date(timeIntervalSince1970: $0.time / 1_000) })
+                   createdAt: comment.created.map { Date(timeIntervalSince1970: $0.time / 1_000) },
+                   authorID: comment.actor)
     }
     private static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do { return try JSONDecoder().decode(type, from: data) } catch { throw SocialError.invalidResponse }
@@ -586,6 +589,7 @@ private struct LinkedInComment: Decodable {
     let commentUrn: String
     let message: CommentMessage
     let created: AuditStamp?
+    let actor: String?
 }
 private struct CommentMessage: Decodable { let text: String }
 private struct AuditStamp: Decodable { let time: Double }

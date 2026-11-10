@@ -14,6 +14,8 @@ SocialKit is an MIT-licensed Swift 6 package for integrating social accounts int
 
 Create one `SocialClient` per adapter and share a credential store across providers. Each client can manage multiple accounts. Use `capabilities(for:)` for account-aware discovery and handle provider permission errors when access depends on app review or account roles.
 
+`SocialAccount` separates the selected publishing identity (`displayName`, `username`, and stable ID) from the authenticated member name for organization or Page connections. `SocialPost` can carry provider-returned author and reply context without requiring every adapter to supply it. Bluesky additionally supports `resolveMention(_:as:)`; place the returned DID with the exact UTF-8 byte range in `TextPost.mentions` to create a native AT Protocol mention facet. Other adapters do not claim native mention support through this API.
+
 Add the repository as a Swift package dependency and link the `SocialKit` library product. The example and tests use scripted HTTP and require no account, API key, backend, or network.
 
 ```sh

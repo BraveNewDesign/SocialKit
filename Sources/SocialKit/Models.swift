@@ -26,6 +26,7 @@ public enum SocialCapability: String, Sendable, CaseIterable {
     case moderateReplies
     case repost
     case unrepost
+    case resolveMentions
 }
 
 public struct SocialAccount: Codable, Equatable, Sendable, Identifiable {
@@ -43,13 +44,35 @@ public struct SocialAccount: Codable, Equatable, Sendable, Identifiable {
 
     public let id: ID
     public let username: String
+    /// Provider-reported name for the account selected for publishing, when available.
+    public let displayName: String?
+    /// Name of the authenticated member when the selected publishing identity is an organization or Page.
+    public let authenticatedUserName: String?
+    public let profileURL: URL?
     public var platform: SocialPlatform { id.platform }
     public var server: URL { id.server }
     public var remoteID: String { id.remoteID }
 
-    public init(platform: SocialPlatform, server: URL, remoteID: String, username: String) {
+    public init(platform: SocialPlatform, server: URL, remoteID: String, username: String,
+                displayName: String? = nil, authenticatedUserName: String? = nil, profileURL: URL? = nil) {
         id = ID(platform: platform, server: server, remoteID: remoteID)
         self.username = username
+        self.displayName = displayName
+        self.authenticatedUserName = authenticatedUserName
+        self.profileURL = profileURL
+    }
+}
+
+/// A resolved, provider-native mention. Byte offsets refer to the UTF-8 encoded post text.
+public struct SocialMention: Codable, Equatable, Sendable {
+    public let byteStart: Int
+    public let byteEnd: Int
+    public let subjectID: String
+
+    public init(byteStart: Int, byteEnd: Int, subjectID: String) {
+        self.byteStart = byteStart
+        self.byteEnd = byteEnd
+        self.subjectID = subjectID
     }
 }
 
@@ -57,12 +80,24 @@ public struct TextPost: Codable, Sendable {
     public let text: String
     public let idempotencyKey: UUID
     public let createdAt: Date
+    public let mentions: [SocialMention]
 
     /// Create once per intended post. Preserve the entire draft if reconciling or retrying.
-    public init(text: String, idempotencyKey: UUID = UUID(), createdAt: Date = Date()) {
+    public init(text: String, idempotencyKey: UUID = UUID(), createdAt: Date = Date(), mentions: [SocialMention] = []) {
         self.text = text
         self.idempotencyKey = idempotencyKey
         self.createdAt = createdAt
+        self.mentions = mentions
+    }
+
+    private enum CodingKeys: String, CodingKey { case text, idempotencyKey, createdAt, mentions }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        text = try values.decode(String.self, forKey: .text)
+        idempotencyKey = try values.decodeIfPresent(UUID.self, forKey: .idempotencyKey) ?? UUID()
+        createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        mentions = try values.decodeIfPresent([SocialMention].self, forKey: .mentions) ?? []
     }
 }
 
@@ -112,6 +147,11 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
     public let likeCount: Int?
     public let textFormat: TextFormat
     public let media: [SocialAttachment]
+    public let authorID: String?
+    public let authorName: String?
+    public let authorHandle: String?
+    public let parentID: String?
+    public let conversationRootID: String?
 
     public init(
         id: String,
@@ -120,7 +160,12 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
         createdAt: Date? = nil,
         likeCount: Int? = nil,
         textFormat: TextFormat = .plainText,
-        media: [SocialAttachment] = []
+        media: [SocialAttachment] = [],
+        authorID: String? = nil,
+        authorName: String? = nil,
+        authorHandle: String? = nil,
+        parentID: String? = nil,
+        conversationRootID: String? = nil
     ) {
         self.id = id
         self.text = text
@@ -129,6 +174,11 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
         self.likeCount = likeCount
         self.textFormat = textFormat
         self.media = media
+        self.authorID = authorID
+        self.authorName = authorName
+        self.authorHandle = authorHandle
+        self.parentID = parentID
+        self.conversationRootID = conversationRootID
     }
 }
 
