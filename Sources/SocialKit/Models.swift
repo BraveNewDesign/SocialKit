@@ -152,6 +152,8 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
     public let authorHandle: String?
     public let parentID: String?
     public let conversationRootID: String?
+    /// Provider-confirmed ownership for reply records when the API exposes it.
+    public let isOwnedByAccount: Bool?
 
     public init(
         id: String,
@@ -165,7 +167,8 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
         authorName: String? = nil,
         authorHandle: String? = nil,
         parentID: String? = nil,
-        conversationRootID: String? = nil
+        conversationRootID: String? = nil,
+        isOwnedByAccount: Bool? = nil
     ) {
         self.id = id
         self.text = text
@@ -179,6 +182,7 @@ public struct SocialPost: Equatable, Sendable, Identifiable {
         self.authorHandle = authorHandle
         self.parentID = parentID
         self.conversationRootID = conversationRootID
+        self.isOwnedByAccount = isOwnedByAccount
     }
 }
 

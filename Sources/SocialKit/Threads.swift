@@ -202,7 +202,7 @@ public struct ThreadsAdapter: SocialAdapter {
     public func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try validate(credential)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
-        var query = [("fields", "id,text,username,timestamp,permalink,media_type,media_url")]
+        var query = [("fields", "id,text,username,is_reply_owned_by_me,is_reply,root_post,replied_to,timestamp,permalink,media_type,media_url")]
         if let cursor { query.append(("after", cursor)) }
         let value: MetaPageResponse<MetaPostRecord> = try await api.get("/\(try metaPathID(postID))/replies", query: query)
         let after = value.paging?.cursors?.after
@@ -252,7 +252,7 @@ public struct ThreadsAdapter: SocialAdapter {
         }
     }
 
-    private static let postFields = "id,text,permalink,timestamp,media_type,media_url"
+    private static let postFields = "id,text,username,is_reply_owned_by_me,is_reply,root_post,replied_to,permalink,timestamp,media_type,media_url"
 }
 
 private struct ThreadsProfile: Decodable, Sendable { let id: String; let username: String }

@@ -250,7 +250,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
     public func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try validate(credential)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
-        var query = [("fields", "id,message,from,permalink_url,created_time,like_count"), ("limit", "100")]
+        var query = [("fields", "id,message,from{id,name},permalink_url,created_time,like_count"), ("limit", "100")]
         if let cursor { query.append(("after", cursor)) }
         let result: MetaPageResponse<MetaCommentRecord> = try await api.get("/\(try metaPathID(postID))/comments", query: query)
         return SocialPage(items: result.data.map(metaComment), nextCursor: result.paging?.next == nil ? nil : result.paging?.cursors?.after)
@@ -267,7 +267,7 @@ public struct FacebookPagesAdapter: SocialAdapter {
               !credential.accessToken.isEmpty else { throw SocialError.invalidConfiguration }
     }
 
-    private static let postFields = "id,message,permalink_url,created_time,likes.limit(0).summary(true),attachments{media_type,media,subattachments}"
+    private static let postFields = "id,message,from{id,name},permalink_url,created_time,likes.limit(0).summary(true),attachments{media_type,media,subattachments}"
 }
 
 private struct FacebookPageChoice: Decodable, Sendable {

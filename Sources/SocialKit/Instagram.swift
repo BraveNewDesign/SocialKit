@@ -257,7 +257,7 @@ public struct InstagramAdapter: SocialAdapter {
     public func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try validate(credential)
         let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
-        var query = [("fields", "id,text,username,timestamp,like_count"), ("limit", "100")]
+        var query = [("fields", "id,text,username,from,user,timestamp,like_count"), ("limit", "100")]
         if let cursor { query.append(("after", cursor)) }
         let result: MetaPageResponse<MetaCommentRecord> = try await api.get("/\(try metaPathID(postID))/comments", query: query)
         return SocialPage(items: result.data.map(metaComment), nextCursor: result.paging?.next == nil ? nil : result.paging?.cursors?.after)
@@ -280,7 +280,7 @@ public struct InstagramAdapter: SocialAdapter {
         }
     }
 
-    private static let postFields = "id,caption,permalink,timestamp,like_count,media_type,media_url"
+    private static let postFields = "id,caption,username,permalink,timestamp,like_count,media_type,media_url"
 }
 
 private struct InstagramProfile: Decodable, Sendable { let id: String?; let user_id: String?; let username: String }
@@ -301,6 +301,7 @@ private struct InstagramChildrenResponse: Decodable, Sendable {
 private struct InstagramPostRecord: Decodable, Sendable {
     let id: String
     let caption: String?
+    let username: String?
     let permalink: URL?
     let timestamp: String?
     let like_count: Int?
@@ -312,6 +313,7 @@ private struct InstagramPostRecord: Decodable, Sendable {
             (media_type?.uppercased() == "VIDEO" || media_type?.uppercased() == "REELS" ? .video : .unknown)
         let attachments = media_type == nil ? [] : [SocialAttachment(kind: kind, url: media_url)]
         let createdAt = timestamp.flatMap { ISO8601DateFormatter().date(from: $0) }
-        return SocialPost(id: id, text: caption ?? "", url: permalink, createdAt: createdAt, likeCount: like_count, media: attachments)
+        return SocialPost(id: id, text: caption ?? "", url: permalink, createdAt: createdAt,
+                          likeCount: like_count, media: attachments, authorHandle: username)
     }
 }

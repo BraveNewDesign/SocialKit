@@ -123,6 +123,12 @@ struct MetaPostRecord: Decodable, Sendable {
     let media_type: String?
     let media_url: URL?
     let attachments: MetaAttachments?
+    let username: String?
+    let from: MetaAuthor?
+    let is_reply_owned_by_me: Bool?
+    let is_reply: Bool?
+    let root_post: MetaReferenceID?
+    let replied_to: MetaReferenceID?
 
     var normalizedText: String { text ?? message ?? caption ?? "" }
     var normalizedURL: URL? { permalink ?? permalink_url }
@@ -132,6 +138,28 @@ struct MetaPostRecord: Decodable, Sendable {
         return metaDate(value)
     }
     var normalizedLikes: Int? { like_count ?? likes?.summary?.total_count }
+}
+
+struct MetaAuthor: Decodable, Sendable {
+    let id: String?
+    let name: String?
+    let username: String?
+}
+
+/// Meta fields can be returned as either an ID scalar or an object containing `id`.
+struct MetaReferenceID: Decodable, Sendable {
+    let id: String
+
+    init(from decoder: Decoder) throws {
+        if let scalar = try? decoder.singleValueContainer().decode(String.self) {
+            id = scalar
+        } else {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case id }
 }
 
 struct MetaCommentRecord: Decodable, Sendable {
@@ -144,8 +172,10 @@ struct MetaCommentRecord: Decodable, Sendable {
     let created_time: String?
     let timestamp: String?
     let like_count: Int?
+    /// Instagram returns `user` only when the authenticated app user authored the comment.
+    let user: String?
 
-    struct From: Decodable, Sendable { let id: String?; let name: String?; let username: String? }
+    typealias From = MetaAuthor
     var normalizedText: String { text ?? message ?? "" }
     var normalizedDate: Date? {
         guard let value = timestamp ?? created_time else { return nil }
@@ -164,7 +194,8 @@ func metaComment(_ value: MetaCommentRecord) -> SocialPost {
     SocialPost(id: value.id, text: value.normalizedText, url: value.permalink_url,
                createdAt: value.normalizedDate, likeCount: value.like_count,
                authorID: value.from?.id, authorName: value.from?.name,
-               authorHandle: value.username ?? value.from?.username)
+               authorHandle: value.username ?? value.from?.username,
+               isOwnedByAccount: value.user == nil ? nil : true)
 }
 
 struct MetaCount: Decodable, Sendable {
@@ -198,7 +229,11 @@ func metaPost(_ value: MetaPostRecord) -> SocialPost {
     let media = hasMediaType || attachmentURL != nil ? [SocialAttachment(kind: kind, url: attachmentURL)] : []
     return SocialPost(id: value.id, text: value.normalizedText, url: value.normalizedURL,
                       createdAt: value.normalizedDate, likeCount: value.normalizedLikes,
-                      media: media)
+                      media: media, authorID: value.from?.id,
+                      authorName: value.from?.name, authorHandle: value.username ?? value.from?.username,
+                      parentID: value.replied_to?.id,
+                      conversationRootID: value.root_post?.id,
+                      isOwnedByAccount: value.is_reply_owned_by_me)
 }
 
 func metaPathID(_ id: String) throws -> String {

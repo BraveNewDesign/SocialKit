@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// App-password based XRPC adapter for Bluesky and compatible AT Protocol PDSes.
@@ -83,6 +84,12 @@ public struct BlueskyAdapter: SocialAdapter {
         "at://\(accountDID)/\(Self.postCollection)/\(try Self.recordKey(for: idempotencyKey, createdAt: createdAt))"
     }
 
+    /// Compute the URI used by SocialKit versions before the wider same-second
+    /// record-key distribution. Use only to reconcile an older ambiguous write.
+    public static func legacyPostID(for idempotencyKey: UUID, createdAt: Date, accountDID: String) throws -> String {
+        "at://\(accountDID)/\(Self.postCollection)/\(try Self.legacyRecordKey(for: idempotencyKey, createdAt: createdAt))"
+    }
+
     public func publish(_ draft: TextPost, credential: SocialCredential) async throws -> SocialPost {
         let origin = try Self.origin(for: credential)
         guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -153,23 +160,29 @@ public struct BlueskyAdapter: SocialAdapter {
         let text: String
         let createdAt: String
         let likeCount: Int?
+        let author: AppViewPost.Author?
         if reference.did == credential.account.remoteID {
             let record = try await getPostRecord(reference, origin: origin, credential: credential)
             text = record.value.text
             createdAt = record.value.createdAt
             likeCount = nil
+            author = nil
         } else {
             let record = try await getPublicPost(reference.uri)
             text = record.record.text
             createdAt = record.record.createdAt
             likeCount = record.likeCount
+            author = record.author
         }
         return SocialPost(
             id: reference.uri,
             text: text,
             url: Self.webURL(did: reference.did, rkey: reference.rkey),
             createdAt: Self.parseTimestamp(createdAt),
-            likeCount: likeCount
+            likeCount: likeCount,
+            authorID: reference.did,
+            authorName: author?.displayName,
+            authorHandle: author?.handle
         )
     }
 
@@ -190,7 +203,10 @@ public struct BlueskyAdapter: SocialAdapter {
             return SocialPost(
                 id: post.uri, text: post.record.text,
                 url: Self.webURL(did: reference.did, rkey: reference.rkey),
-                createdAt: Self.parseTimestamp(post.record.createdAt), likeCount: post.likeCount
+                createdAt: Self.parseTimestamp(post.record.createdAt), likeCount: post.likeCount,
+                authorID: post.author?.did ?? reference.did,
+                authorName: post.author?.displayName,
+                authorHandle: post.author?.handle
             )
         }
         return SocialPage(items: items, nextCursor: page.cursor == cursor ? nil : page.cursor)
@@ -239,6 +255,23 @@ public struct BlueskyAdapter: SocialAdapter {
     }
 
     private static func recordKey(for uuid: UUID, createdAt: Date) throws -> String {
+        // A TID has 53 timestamp bits and only 10 clock bits. Spread drafts
+        // across all microseconds in their creation second so concurrent drafts
+        // do not compete for just 1,024 clock values. The full UUID is hashed
+        // before reducing it to the available TID space.
+        let second = createdAt.timeIntervalSince1970.rounded(.down)
+        let baseMicros = second * 1_000_000
+        guard baseMicros.isFinite, baseMicros >= 0,
+              baseMicros <= Double((1 << 53) - 1 - 999_999) else { throw SocialError.invalidInput }
+        let digest = SHA256.hash(data: Data(uuid.uuidString.utf8))
+        let hash = digest.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let slot = hash % (1_000_000 * 1_024)
+        let micros = UInt64(baseMicros) + slot / 1_024
+        let clock = slot % 1_024
+        return Self.tid((micros << 10) | clock)
+    }
+
+    private static func legacyRecordKey(for uuid: UUID, createdAt: Date) throws -> String {
         let micros = createdAt.timeIntervalSince1970 * 1_000_000
         guard micros.isFinite, micros >= 0, micros < Double(1 << 53) else { throw SocialError.invalidInput }
         let bytes = uuid.uuid
@@ -402,5 +435,12 @@ public struct BlueskyAdapter: SocialAdapter {
         let cid: String
         let record: PostRecord
         let likeCount: Int?
+        let author: Author?
+
+        struct Author: Decodable {
+            let did: String
+            let handle: String?
+            let displayName: String?
+        }
     }
 }
