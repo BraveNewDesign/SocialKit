@@ -1,5 +1,13 @@
 import Foundation
 
+/// The access-token flow used for an Instagram professional account.
+public enum InstagramAccessMethod: String, Sendable, CaseIterable {
+    /// Instagram Business Login, using an Instagram User access token and graph.instagram.com.
+    case instagramLogin
+    /// Instagram API with Facebook Login, using a Facebook User token and Page token. The newer Unified Login flow uses a different system-user token setup.
+    case facebookLogin
+}
+
 public struct InstagramAuthorization: Sendable {
     public let clientID: String
     public let redirectURI: URL
@@ -35,8 +43,10 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
     ]
 
     private let transport: any HTTPTransport
-    private let origin = URL(string: "https://graph.instagram.com/v27.0")!
-    private let accountServer = URL(string: "https://graph.instagram.com")!
+    private let instagramLoginOrigin = URL(string: "https://graph.instagram.com/v27.0")!
+    private let instagramLoginServer = URL(string: "https://graph.instagram.com")!
+    private let facebookLoginOrigin = URL(string: "https://graph.facebook.com/v27.0")!
+    private let facebookLoginServer = URL(string: "https://graph.facebook.com")!
     private let pollAttempts: Int
     private let pollIntervalNanoseconds: UInt64
 
@@ -68,42 +78,142 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
         let callback = try await authorization.browser(authURL, authorization.redirectURI)
         let code = try transaction.code(from: normalizeMetaOAuthCallback(callback, platform: .instagram))
         let token = try await authorization.exchange.exchange(platform: .instagram, code: code, redirectURI: authorization.redirectURI)
-        let account = try await fetchProfile(accessToken: token.accessToken)
+        let account = try await fetchInstagramLoginProfile(accessToken: token.accessToken)
         return SocialCredential(account: account, accessToken: token.accessToken,
                                 expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
                                 metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
     }
 
     /// Builds an Instagram credential from an access token supplied by a development token flow.
-    public func developmentCredential(_ token: OAuthToken) async throws -> SocialCredential {
+    public func developmentCredential(
+        _ token: OAuthToken,
+        accessMethod: InstagramAccessMethod = .instagramLogin,
+        instagramAccountID: String? = nil
+    ) async throws -> SocialCredential {
         try validateMetaDevelopmentToken(token)
-        let account = try await fetchProfile(accessToken: token.accessToken)
-        return SocialCredential(account: account, accessToken: token.accessToken,
-                                expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
-                                metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
+        switch accessMethod {
+        case .instagramLogin:
+            let account = try await fetchInstagramLoginProfile(accessToken: token.accessToken)
+            return SocialCredential(account: account, accessToken: token.accessToken,
+                                    expiresAt: token.expiresAt, grantedScopes: token.grantedScopes,
+                                    metaLongLivedRefreshEligibleAt: token.metaLongLivedRefreshEligibleAt)
+        case .facebookLogin:
+            guard let instagramAccountID else { throw SocialError.invalidInput }
+            return try await facebookLoginCredential(token, instagramAccountID: instagramAccountID)
+        }
     }
 
     /// Fetches the authenticated Instagram professional account associated with this credential.
     public func profile(credential: SocialCredential) async throws -> SocialAccount {
         try validate(credential)
-        return try await fetchProfile(accessToken: credential.accessToken)
+        return try await fetchProfile(credential: credential)
     }
 
-    private func fetchProfile(accessToken: String) async throws -> SocialAccount {
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: accessToken)
+    private func fetchInstagramLoginProfile(accessToken: String) async throws -> SocialAccount {
+        let api = try MetaHTTP(transport: transport, origin: instagramLoginOrigin, accessToken: accessToken)
         let profile: InstagramProfile = try await api.get("/me", query: [("fields", "id,user_id,username")])
         guard let userID = profile.user_id ?? profile.id, !userID.isEmpty else { throw SocialError.invalidResponse }
-        return SocialAccount(platform: .instagram, server: accountServer, remoteID: userID, username: profile.username,
+        return SocialAccount(platform: .instagram, server: instagramLoginServer, remoteID: userID, username: profile.username,
                              displayName: profile.username,
+                             profileURL: URL(string: "https://www.instagram.com/\(profile.username)/"))
+    }
+
+    private func facebookLoginCredential(_ token: OAuthToken, instagramAccountID: String) async throws -> SocialCredential {
+        let instagramID = try metaPathID(instagramAccountID)
+        let userAPI = try MetaHTTP(transport: transport, origin: facebookLoginOrigin, accessToken: token.accessToken)
+        let permissions: MetaPageResponse<InstagramPermission>
+        do {
+            permissions = try await userAPI.get("/me/permissions")
+        } catch SocialError.permissionDenied {
+            throw SocialError.permissionDeniedAt("reading granted user permissions")
+        }
+        let scopes = Set(permissions.data.filter { $0.status == "granted" }.map(\.permission))
+        let requiredScopes: Set<String> = ["pages_show_list", "pages_read_engagement", "instagram_basic", "instagram_content_publish"]
+        let missingScopes = requiredScopes.subtracting(scopes).sorted()
+        guard missingScopes.isEmpty else {
+            throw SocialError.permissionDeniedAt("checking the user token; missing granted permissions: \(missingScopes.joined(separator: ", "))")
+        }
+
+        let pages: [FacebookLoginPage]
+        do {
+            pages = try await facebookLoginPages(api: userAPI)
+        } catch SocialError.permissionDenied {
+            throw SocialError.permissionDeniedAt("reading Pages and their linked Instagram accounts")
+        }
+        guard let page = pages.first(where: { $0.instagramBusinessAccount?.id == instagramID }) else {
+            throw SocialError.invalidInput
+        }
+        guard page.tasks?.contains("CREATE_CONTENT") == true else {
+            throw SocialError.permissionDeniedAt("checking Page access; the linked Facebook Page must include the CREATE_CONTENT task")
+        }
+        guard !page.accessToken.isEmpty else { throw SocialError.invalidResponse }
+
+        let pageCredentialAPI = try MetaHTTP(transport: transport, origin: facebookLoginOrigin,
+                                             accessToken: page.accessToken)
+        let profile: InstagramProfile
+        do {
+            profile = try await facebookLoginProfile(instagramID: instagramID, api: pageCredentialAPI)
+        } catch SocialError.permissionDenied {
+            throw SocialError.permissionDeniedAt("reading the linked Instagram profile with its Page token")
+        }
+        let account = SocialAccount(platform: .instagram, server: facebookLoginServer, remoteID: instagramID,
+                                    username: profile.username, displayName: profile.username,
+                                    profileURL: URL(string: "https://www.instagram.com/\(profile.username)/"))
+        let sourceGrant = OAuthToken(accessToken: token.accessToken, expiresAt: token.expiresAt,
+                                     grantedScopes: scopes)
+        return SocialCredential(account: account, accessToken: page.accessToken, grantedScopes: scopes,
+                                facebookPageSourceGrant: sourceGrant)
+    }
+
+    private func facebookLoginPages(api: MetaHTTP) async throws -> [FacebookLoginPage] {
+        var cursor: String?
+        var pages: [FacebookLoginPage] = []
+        var seenCursors = Set<String>()
+        for _ in 0..<50 {
+            var query = [("fields", "id,name,access_token,tasks,instagram_business_account{id}"), ("limit", "100")]
+            if let cursor { query.append(("after", cursor)) }
+            let response: MetaPageResponse<FacebookLoginPage> = try await api.get("/me/accounts", query: query)
+            pages.append(contentsOf: response.data)
+            guard response.paging?.next != nil else { return pages }
+            guard let after = response.paging?.cursors?.after, !after.isEmpty,
+                  seenCursors.insert(after).inserted else { throw SocialError.invalidResponse }
+            cursor = after
+        }
+        throw SocialError.invalidResponse
+    }
+
+    private func facebookLoginProfile(instagramID: String, api: MetaHTTP) async throws -> InstagramProfile {
+        let profile: InstagramProfile = try await api.get("/\(instagramID)", query: [("fields", "id,username")])
+        guard profile.id == instagramID, !profile.username.isEmpty else { throw SocialError.invalidResponse }
+        return profile
+    }
+
+    private func fetchProfile(credential: SocialCredential) async throws -> SocialAccount {
+        let api = try api(for: credential)
+        let profile: InstagramProfile
+        if credential.account.server.host == facebookLoginServer.host {
+            profile = try await facebookLoginProfile(instagramID: credential.account.remoteID, api: api)
+        } else {
+            profile = try await api.get("/me", query: [("fields", "id,user_id,username")])
+        }
+        guard let userID = profile.user_id ?? profile.id, userID == credential.account.remoteID else {
+            throw SocialError.invalidResponse
+        }
+        return SocialAccount(platform: .instagram, server: credential.account.server, remoteID: userID,
+                             username: profile.username, displayName: profile.username,
                              profileURL: URL(string: "https://www.instagram.com/\(profile.username)/"))
     }
 
     public func refresh(_ credential: SocialCredential) async throws -> SocialCredential {
         try validate(credential)
+        if credential.account.server.host == facebookLoginServer.host {
+            guard let sourceGrant = credential.facebookPageSourceGrant else { throw SocialError.authenticationRequired }
+            return try await facebookLoginCredential(sourceGrant, instagramAccountID: credential.account.remoteID)
+        }
         let now = Date()
         if let expiry = credential.expiresAt, expiry <= now { throw SocialError.authenticationRequired }
         guard credential.canRefreshMetaLongLivedToken(at: now) else { throw SocialError.unsupported(.refreshSession) }
-        let api = try MetaHTTP(transport: transport, origin: accountServer, accessToken: credential.accessToken)
+        let api = try MetaHTTP(transport: transport, origin: instagramLoginOrigin, accessToken: credential.accessToken)
         let value: InstagramRefreshResponse = try await api.get("/refresh_access_token", query: [
             ("grant_type", "ig_refresh_token"), ("access_token", credential.accessToken)
         ])
@@ -117,11 +227,22 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
     public func capabilities(for credential: SocialCredential) -> Set<SocialCapability> {
         guard let scopes = credential.grantedScopes else { return capabilities }
         var result = capabilities
-        guard scopes.contains("instagram_business_basic") else { return [] }
-        if !scopes.contains("instagram_business_content_publish") { result.subtract([.publishMedia, .publishMultipleMedia]) }
-        if !scopes.contains("instagram_business_manage_comments") {
+        let facebookLogin = credential.account.server.host == facebookLoginServer.host
+        let basicScope = facebookLogin ? "instagram_basic" : "instagram_business_basic"
+        let publishingScope = facebookLogin ? "instagram_content_publish" : "instagram_business_content_publish"
+        let commentsScope = facebookLogin ? "instagram_manage_comments" : "instagram_business_manage_comments"
+        guard scopes.contains(basicScope) else { return [] }
+        if !scopes.contains(publishingScope) || facebookLogin && !scopes.contains("pages_read_engagement") {
+            result.subtract([.publishMedia, .publishMultipleMedia])
+        }
+        if facebookLogin && !scopes.contains("pages_read_engagement") {
+            result.remove(.readPost)
+            result.remove(.listPosts)
+        }
+        if !scopes.contains(commentsScope) {
             result.remove(.reply); result.remove(.readReplies); result.remove(.deleteReply)
         }
+        if facebookLogin && credential.facebookPageSourceGrant == nil { result.remove(.refreshSession) }
         return result
     }
 
@@ -139,7 +260,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
     ) async throws -> SocialPost {
         try validate(credential)
         let accountID = try metaPathID(credential.account.remoteID)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         var form: [(String, String)]
         switch media {
         case .imageURL(let url):
@@ -206,7 +327,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
         }
 
         let accountID = try metaPathID(credential.account.remoteID)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         let containerID = try await metaPublishingContainer(checkpoint: checkpoint, draft: draft, save: save) {
             var children: [String] = []
             for (url, mediaType) in items {
@@ -243,7 +364,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
     func wasPublished(_ checkpoint: MetaPublishingCheckpoint, credential: SocialCredential) async throws -> Bool {
         try validate(credential)
         let id = try metaPathID(checkpoint.containerID)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         let status: InstagramContainerStatus = try await api.get("/\(id)", query: [("fields", "id,status_code")])
         guard status.id == id else { throw SocialError.invalidResponse }
         return status.status_code == "PUBLISHED"
@@ -272,7 +393,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
 
     public func post(id: String, credential: SocialCredential) async throws -> SocialPost {
         try validate(credential)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         let mediaID = try metaPathID(id)
         let value: InstagramPostRecord = try await api.get("/\(mediaID)", query: [("fields", Self.postFields)])
         let post = value.post
@@ -284,7 +405,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
 
     public func posts(cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try validate(credential)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         var query = [("fields", Self.postFields), ("limit", "100")]
         if let cursor { query.append(("after", cursor)) }
         let result: MetaPageResponse<InstagramPostRecord> = try await api.get("/\(try metaPathID(credential.account.remoteID))/media", query: query)
@@ -295,7 +416,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
     public func reply(_ draft: TextPost, to postID: String, credential: SocialCredential) async throws -> SocialPost {
         try validate(credential)
         guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SocialError.invalidInput }
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         let result: MetaID = try await api.post("/\(try metaPathID(postID))/replies", form: [("message", draft.text)], key: draft.idempotencyKey)
         return SocialPost(id: result.id, text: draft.text)
     }
@@ -303,7 +424,7 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
     /// Lists comments on an Instagram media object. Meta exposes comment replies as a separate edge.
     public func replies(to postID: String, cursor: String?, credential: SocialCredential) async throws -> SocialPage<SocialPost> {
         try validate(credential)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         var query = [("fields", "id,text,username,from,user,timestamp,like_count"), ("limit", "100")]
         if let cursor { query.append(("after", cursor)) }
         let result: MetaPageResponse<MetaCommentRecord> = try await api.get("/\(try metaPathID(postID))/comments", query: query)
@@ -312,13 +433,26 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
 
     public func deleteReply(id: String, credential: SocialCredential) async throws {
         try validate(credential)
-        let api = try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
+        let api = try api(for: credential)
         try await api.delete("/\(try metaPathID(id))")
     }
 
     private func validate(_ credential: SocialCredential) throws {
-        guard credential.account.platform == .instagram, credential.account.server == accountServer else { throw SocialError.invalidConfiguration }
+        guard credential.account.platform == .instagram,
+              credential.account.server.host == instagramLoginServer.host || credential.account.server.host == facebookLoginServer.host else {
+            throw SocialError.invalidConfiguration
+        }
         guard !credential.accessToken.isEmpty else { throw SocialError.authenticationRequired }
+    }
+
+    private func api(for credential: SocialCredential) throws -> MetaHTTP {
+        let origin: URL
+        switch credential.account.server.host {
+        case instagramLoginServer.host: origin = instagramLoginOrigin
+        case facebookLoginServer.host: origin = facebookLoginOrigin
+        default: throw SocialError.invalidConfiguration
+        }
+        return try MetaHTTP(transport: transport, origin: origin, accessToken: credential.accessToken)
     }
 
     private func requireHTTPS(_ url: URL) throws {
@@ -331,6 +465,17 @@ public struct InstagramAdapter: MetaCheckpointPublishing {
 }
 
 private struct InstagramProfile: Decodable, Sendable { let id: String?; let user_id: String?; let username: String }
+private struct InstagramPermission: Decodable, Sendable { let permission: String; let status: String }
+private struct FacebookLoginPage: Decodable, Sendable {
+    struct InstagramBusinessAccount: Decodable, Sendable { let id: String }
+    let id: String
+    let name: String?
+    let access_token: String
+    let tasks: [String]?
+    let instagram_business_account: InstagramBusinessAccount?
+    var instagramBusinessAccount: InstagramBusinessAccount? { instagram_business_account }
+    var accessToken: String { access_token }
+}
 private struct InstagramContainerStatus: Decodable, Sendable { let id: String; let status_code: String }
 private struct InstagramRefreshResponse: Decodable, Sendable { let access_token: String; let expires_in: Int }
 private struct InstagramChildrenResponse: Decodable, Sendable {

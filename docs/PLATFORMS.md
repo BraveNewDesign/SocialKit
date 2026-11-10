@@ -24,7 +24,19 @@ Provider-held Page scheduling is disabled. Meta documents scheduling fields incl
 
 ## Instagram
 
-Configure Instagram Login for a Business or Creator account. The adapter uses Graph API v27.0 on the Instagram host. Use `instagram_business_basic` for professional media reads, `instagram_business_content_publish` to publish and `instagram_business_manage_comments` for moderation and replies. The Instagram Login token and scopes are distinct from Facebook Login. The adapter creates a media container, polls for a terminal processing result, and publishes a ready container once. Pass an externally accessible HTTPS image or Reel URL. Meta fetches the file directly, so it must remain reachable without an authorization header through processing. SocialKit does not fetch or host it. This path covers single images, Reels, and ordered carousels of 2–10 images or videos. Carousel children are checked before creating the parent. Single-media lookup returns carousel child attachments. Refresh an eligible long-lived user token before it expires. The Facebook Login variant, Stories, direct file upload, and likes are outside this adapter. [Instagram Login collection](https://www.postman.com/meta/instagram/folder/1z5vxzu/instagram-api-with-instagram-login), [Content publishing](https://developers.facebook.com/docs/instagram-platform/content-publishing).
+The adapter supports two distinct authentication routes for Business or Creator accounts. Both use Graph API v27.0 and the same media operations, but their hosts, token types, and permission names differ.
+
+### Instagram Login
+
+Use Instagram's own user token for the professional account. The adapter uses the Instagram API host. Grant `instagram_business_basic` for professional media reads, `instagram_business_content_publish` to publish, and `instagram_business_manage_comments` for moderation and replies. This token and these scopes are distinct from Facebook Login. Refresh an eligible long-lived token before it expires.
+
+### Facebook Login with a linked Page
+
+Use a Facebook user token with access to the Page linked to the Business or Creator account. The adapter discovers the user's Pages, verifies the selected Page and its Instagram professional account association, obtains the Page access token, and sends Instagram requests through the Facebook Graph API host. The caller supplies the Instagram professional account ID; it is not the Facebook Page ID. Required permissions include `pages_show_list`, `pages_read_engagement`, `instagram_basic`, and `instagram_content_publish`. Comment actions also need `instagram_manage_comments` and the relevant Page access. If the Page role was assigned through Meta Business Manager, Meta may additionally require `ads_read` or `ads_management`; request `ads_read` when it satisfies the app's access needs. The authorizing user needs the Page's `CREATE_CONTENT` task to publish. This is the Facebook Login (`API setup with Facebook login`) route; a system-user token from Unified Login is a different credential flow.
+
+### Publishing behavior
+
+The adapter creates a media container, polls for a terminal processing result, and publishes a ready container once. Pass an externally accessible HTTPS image or Reel URL. Meta fetches the file directly, so it must remain reachable without an authorization header through processing. SocialKit does not fetch or host it. This path covers single images, Reels, and ordered carousels of 2–10 images or videos. Carousel children are checked before creating the parent. Single-media lookup returns carousel child attachments. Stories, direct file upload, and likes are outside this adapter. [Instagram Login collection](https://www.postman.com/meta/instagram/folder/1z5vxzu/instagram-api-with-instagram-login), [Facebook Login setup](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-facebook-login/get-started/), [Content publishing](https://developers.facebook.com/docs/instagram-platform/content-publishing).
 
 ## Optional Meta engagement capabilities
 

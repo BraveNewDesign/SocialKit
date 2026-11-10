@@ -200,6 +200,7 @@ public enum SocialError: Error, Equatable, Sendable {
     case publishOutcomeUnknown(UUID)
     case credentialStorage(Int32)
     case permissionDenied
+    case permissionDeniedAt(String)
     case billingRequired
     case mediaProcessingFailed
     case mediaProcessingTimedOut
@@ -221,6 +222,7 @@ extension SocialError: LocalizedError {
         case .publishOutcomeUnknown: "The provider may have accepted the post. Check before retrying."
         case .credentialStorage: "The credential store could not complete the operation."
         case .permissionDenied: "The provider denied permission for this operation."
+        case .permissionDeniedAt(let context): "Meta denied permission while \(context)."
         case .billingRequired: "The provider requires API billing access or credits."
         case .mediaProcessingFailed: "The provider could not process the media."
         case .mediaProcessingTimedOut: "The media did not finish processing within the polling limit."
